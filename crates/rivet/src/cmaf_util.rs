@@ -183,7 +183,14 @@ pub fn measure_segments(segments: &[SegmentInfo], timescale: u32) -> (u32, u32) 
 /// `avc1`/`avc3` → `avcC` profile/level, `hvc1`/`hev1` → `hvcC` profile-tier-level,
 /// `vp09` → `vpcC` (the full `vp09.PP.LL.DD.CC.cp.tc.mc.FF` form).
 pub fn codec_string_from_init(init_path: &Path) -> Result<String> {
-    let bytes = std::fs::read(init_path)
+    codec_string_from_init_with(&container::output_fs::StdFs, init_path)
+}
+
+/// [`codec_string_from_init`], reading the init segment through `out` — see
+/// [`container::output_fs`].
+pub fn codec_string_from_init_with(out: &dyn container::output_fs::OutputFs, init_path: &Path) -> Result<String> {
+    let bytes = out
+        .read(init_path)
         .with_context(|| format!("reading init segment {}", init_path.display()))?;
     let entries =
         stsd_sample_entries(&bytes).ok_or_else(|| anyhow!("stsd entries not found in init"))?;

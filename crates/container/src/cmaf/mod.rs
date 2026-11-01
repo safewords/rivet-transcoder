@@ -51,8 +51,9 @@
 
 use anyhow::{Context, Result};
 use frame::{ColorMetadata, VideoCodec};
-use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::fs;
+
+use crate::output_fs::{SharedOutputFs, std_fs};
 use std::path::{Path, PathBuf};
 
 use crate::AudioInfo;
@@ -308,9 +309,18 @@ pub struct CmafVideoMuxer {
     base_decode_time: u64,
     pending: Vec<PendingVideoSample>,
     segments: Vec<SegmentInfo>,
+    /// Where init and segment files are stored — see [`crate::output_fs`].
+    output_fs: SharedOutputFs,
 }
 
 impl CmafVideoMuxer {
+    /// Store this muxer's files through `fs` instead of the plain filesystem.
+    /// Call before the first packet is flushed.
+    pub fn with_output_fs(mut self, fs: SharedOutputFs) -> Self {
+        self.output_fs = fs;
+        self
+    }
+
     /// Construct a new video muxer that writes init.mp4 + segments to
     /// `output_dir`. Creates the directory if it doesn't exist.
     ///
@@ -424,6 +434,7 @@ impl CmafVideoMuxer {
             base_decode_time: options.first_segment_base_decode_time,
             pending: Vec::new(),
             segments: Vec::new(),
+            output_fs: std_fs(),
         })
     }
 
@@ -626,20 +637,10 @@ impl CmafVideoMuxer {
         }
 
         let path = self.output_dir.join(format!("seg-{:05}.m4s", seq));
-        let file = File::create(&path)
-            .with_context(|| format!("creating CMAF segment file: {}", path.display()))?;
-        let mut writer = BufWriter::new(file);
-        writer.write_all(&moof.bytes).context("writing moof")?;
-        writer
-            .write_all(&(mdat_box_size as u32).to_be_bytes())
-            .context("writing mdat size")?;
-        writer.write_all(b"mdat").context("writing mdat type")?;
-        for sample in &self.pending {
-            writer
-                .write_all(&sample.payload)
-                .context("writing mdat payload")?;
-        }
-        writer.flush().context("flushing CMAF segment writer")?;
+        let bytes = assemble_segment(&moof.bytes, mdat_box_size, self.pending.iter().map(|s| s.payload.as_slice()));
+        self.output_fs
+            .write(&path, &bytes)
+            .with_context(|| format!("writing CMAF segment file: {}", path.display()))?;
         let byte_size = moof.bytes.len() as u64 + mdat_box_size;
 
         self.base_decode_time += segment_duration;
@@ -763,18 +764,27 @@ impl CmafVideoMuxer {
                 unreachable!("refused by the constructor")
             }
         };
-        let mut file = File::create(&self.init_path).with_context(|| {
+        self.output_fs.write(&self.init_path, &init).with_context(|| {
             format!(
-                "creating CMAF video init segment: {}",
+                "writing CMAF video init segment: {}",
                 self.init_path.display()
             )
         })?;
-        file.write_all(&init)
-            .context("writing CMAF video init segment bytes")?;
-        file.flush().context("flushing CMAF video init segment")?;
         self.init_written = true;
         Ok(())
     }
+}
+
+/// One media segment, whole: `moof`, the `mdat` header, the payloads.
+fn assemble_segment<'a>(moof: &[u8], mdat_box_size: u64, payloads: impl Iterator<Item = &'a [u8]>) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(moof.len() + mdat_box_size as usize);
+    bytes.extend_from_slice(moof);
+    bytes.extend_from_slice(&(mdat_box_size as u32).to_be_bytes());
+    bytes.extend_from_slice(b"mdat");
+    for payload in payloads {
+        bytes.extend_from_slice(payload);
+    }
+    bytes
 }
 
 // =====================================================================
@@ -796,9 +806,18 @@ pub struct CmafAudioMuxer {
     segments: Vec<SegmentInfo>,
     /// The track's presentation edit ([`Self::set_edit`]); identity by default.
     edit: crate::edit::TrackEdit,
+    /// Where init and segment files are stored — see [`crate::output_fs`].
+    output_fs: SharedOutputFs,
 }
 
 impl CmafAudioMuxer {
+    /// Store this muxer's files through `fs` instead of the plain filesystem.
+    /// Call before the first packet is flushed.
+    pub fn with_output_fs(mut self, fs: SharedOutputFs) -> Self {
+        self.output_fs = fs;
+        self
+    }
+
     pub fn new(output_dir: impl AsRef<Path>, info: AudioInfo) -> Result<Self> {
         let output_dir = output_dir.as_ref().to_path_buf();
         fs::create_dir_all(&output_dir)
@@ -815,6 +834,7 @@ impl CmafAudioMuxer {
             pending: Vec::new(),
             segments: Vec::new(),
             edit: crate::edit::TrackEdit::default(),
+            output_fs: std_fs(),
         })
     }
 
@@ -877,26 +897,10 @@ impl CmafAudioMuxer {
         }
 
         let path = self.output_dir.join(format!("seg-{:05}.m4s", seq));
-        let file = File::create(&path)
-            .with_context(|| format!("creating CMAF audio segment file: {}", path.display()))?;
-        let mut writer = BufWriter::new(file);
-        writer
-            .write_all(&moof.bytes)
-            .context("writing audio moof")?;
-        writer
-            .write_all(&(mdat_box_size as u32).to_be_bytes())
-            .context("writing audio mdat size")?;
-        writer
-            .write_all(b"mdat")
-            .context("writing audio mdat type")?;
-        for sample in &self.pending {
-            writer
-                .write_all(&sample.payload)
-                .context("writing audio mdat payload")?;
-        }
-        writer
-            .flush()
-            .context("flushing CMAF audio segment writer")?;
+        let bytes = assemble_segment(&moof.bytes, mdat_box_size, self.pending.iter().map(|s| s.payload.as_slice()));
+        self.output_fs
+            .write(&path, &bytes)
+            .with_context(|| format!("writing CMAF audio segment file: {}", path.display()))?;
         let byte_size = moof.bytes.len() as u64 + mdat_box_size;
 
         self.base_decode_time += segment_duration;
@@ -930,15 +934,12 @@ impl CmafAudioMuxer {
             return Ok(());
         }
         let init = build_init_segment_audio_with_edit(&self.info, &self.edit);
-        let mut file = File::create(&self.init_path).with_context(|| {
+        self.output_fs.write(&self.init_path, &init).with_context(|| {
             format!(
-                "creating CMAF audio init segment: {}",
+                "writing CMAF audio init segment: {}",
                 self.init_path.display()
             )
         })?;
-        file.write_all(&init)
-            .context("writing CMAF audio init segment bytes")?;
-        file.flush().context("flushing CMAF audio init segment")?;
         self.init_written = true;
         Ok(())
     }

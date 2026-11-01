@@ -338,6 +338,7 @@ async fn run_single_file_multigpu(
         cancel: None,
         // The stitched MP4's muxer writes a late start as an edit list.
         video_delay_ticks: 0,
+        output_fs: container::output_fs::std_fs(),
     };
     let rung_packets = multigpu::run_multigpu_single_file(params, Arc::clone(&sink)).await?;
 

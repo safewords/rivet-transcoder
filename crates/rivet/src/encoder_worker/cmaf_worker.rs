@@ -196,7 +196,8 @@ fn encode_one_segment(
             chunk.segment_idx,
             cfg.output_dir.display()
         )
-    })?;
+    })?
+    .with_output_fs(cfg.output_fs.clone());
 
     let mut encoder =
         encode::select_encoder(enc_config.clone(), cfg.backend).context("creating encoder for segment")?;

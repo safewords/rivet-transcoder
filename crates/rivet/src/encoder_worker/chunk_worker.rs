@@ -371,6 +371,7 @@ mod tests {
             base_decode_time_offset: 0,
             output_dir: std::path::PathBuf::from("unused"),
             rung_invariant: Arc::new(RwLock::new(None)),
+            output_fs: container::output_fs::std_fs(),
         }
     }
 

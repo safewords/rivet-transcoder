@@ -535,6 +535,7 @@ fn rung_worker_config(
         base_decode_time_offset: ctx.video_delay_ticks,
         output_dir: ctx.output_root.join(format!("video/{}", rung.label)),
         rung_invariant,
+        output_fs: ctx.output_fs.clone(),
     }
 }
 
@@ -1166,6 +1167,7 @@ mod tests {
             output_root: std::env::temp_dir(),
             constant_qp: false,
             video_delay_ticks: 0,
+            output_fs: container::output_fs::std_fs(),
         }
     }
 
