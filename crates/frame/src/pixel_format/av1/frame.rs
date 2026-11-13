@@ -962,20 +962,20 @@ fn parse_av1_loop_filter_params(
         h.loop_filter_delta_update = br.read_bits(1)? == 1;
         if h.loop_filter_delta_update {
             let mut update_mask = 0u8;
-            for i in 0..8 {
+            for (i, delta) in h.loop_filter_ref_deltas.iter_mut().enumerate() {
                 let update = br.read_bits(1)? == 1;
                 if update {
                     update_mask |= 1 << i;
-                    h.loop_filter_ref_deltas[i] = br.read_su(7)? as i8;
+                    *delta = br.read_su(7)? as i8;
                 }
             }
             h.update_ref_delta_mask = update_mask;
             let mut mode_mask = 0u8;
-            for i in 0..2 {
+            for (i, delta) in h.loop_filter_mode_deltas.iter_mut().enumerate() {
                 let update = br.read_bits(1)? == 1;
                 if update {
                     mode_mask |= 1 << i;
-                    h.loop_filter_mode_deltas[i] = br.read_su(7)? as i8;
+                    *delta = br.read_su(7)? as i8;
                 }
             }
             h.update_mode_delta_mask = mode_mask;
@@ -1019,9 +1019,9 @@ fn parse_av1_lr_params(
 ) -> Option<()> {
     let mut uses_lr = false;
     let mut uses_chroma_lr = false;
-    for i in 0..(num_planes as usize) {
+    for (i, slot) in h.lr_type.iter_mut().enumerate().take(num_planes as usize) {
         let lr_type = br.read_bits(2)? as u8;
-        h.lr_type[i] = lr_type;
+        *slot = lr_type;
         if lr_type != 0 {
             uses_lr = true;
             if i > 0 {
