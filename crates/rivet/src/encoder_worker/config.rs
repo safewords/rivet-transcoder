@@ -66,6 +66,9 @@ pub struct EncoderWorkerConfig {
     /// jobs. See `validate_or_set_rung_invariant` + the requeue path
     /// in `run_encoder_worker_blocking`.
     pub rung_invariant: Arc<RwLock<Option<RungCodecInvariant>>>,
+    /// Where the CMAF path's init and segment files are stored — see
+    /// [`container::output_fs`].
+    pub output_fs: container::output_fs::SharedOutputFs,
 }
 
 #[derive(Debug, Clone)]

@@ -23,6 +23,7 @@ use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
 use crate::nal_mux::{NalMuxCodec, ParamSetLedger};
+use crate::output_fs::{OutputFs, StdFs};
 
 /// Settle the video sample entry of the rendition whose init segment is at
 /// `init_path`, given its media segments in order.
@@ -35,7 +36,18 @@ pub fn settle_video_sample_entry(
     init_path: &Path,
     segments: &[PathBuf],
 ) -> Result<Option<[u8; 4]>> {
-    let mut init = std::fs::read(init_path)
+    settle_video_sample_entry_with(&StdFs, init_path, segments)
+}
+
+/// [`settle_video_sample_entry`], reading and rewriting through `out` — see
+/// [`crate::output_fs`].
+pub fn settle_video_sample_entry_with(
+    out: &dyn OutputFs,
+    init_path: &Path,
+    segments: &[PathBuf],
+) -> Result<Option<[u8; 4]>> {
+    let mut init = out
+        .read(init_path)
         .with_context(|| format!("reading init segment {}", init_path.display()))?;
     let Some(entry) = video_sample_entry(&init) else {
         bail!("no sample entry in init segment {}", init_path.display());
@@ -63,8 +75,9 @@ pub fn settle_video_sample_entry(
     }
     let mut fixed = true;
     'segments: for path in segments {
-        let seg =
-            std::fs::read(path).with_context(|| format!("reading segment {}", path.display()))?;
+        let seg = out
+            .read(path)
+            .with_context(|| format!("reading segment {}", path.display()))?;
         for mdat in
             child_boxes(&seg, 0, seg.len()).filter(|b| &seg[b.start + 4..b.start + 8] == b"mdat")
         {
@@ -98,7 +111,7 @@ pub fn settle_video_sample_entry(
         *byte = if fixed { *byte | 0x80 } else { *byte & 0x7F };
     }
     if init != before {
-        crate::atomic::write_atomic(init_path, &init)
+        out.write(init_path, &init)
             .with_context(|| format!("rewriting init segment {}", init_path.display()))?;
     }
     Ok(Some(settled))
@@ -417,6 +430,76 @@ mod tests {
         assert_eq!(
             settle_video_sample_entry(&dir.path().join("init.mp4"), &[seg.path]).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn a_rendition_through_an_output_fs_never_touches_the_disk() {
+        use crate::output_fs::{SharedOutputFs, tests::MemFs};
+        let dir = tempfile::tempdir().unwrap();
+        let mem = std::sync::Arc::new(MemFs::default());
+        let out: SharedOutputFs = mem.clone();
+        let open = |first: u32, init: bool| {
+            CmafVideoMuxer::new_with_codec_options(
+                dir.path(),
+                640,
+                360,
+                30000,
+                ColorMetadata::default(),
+                VideoCodec::H264,
+                CmafVideoMuxerOptions {
+                    first_segment_index: first,
+                    write_init_segment: init,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .with_output_fs(out.clone())
+        };
+        let mut primary = open(1, true);
+        primary
+            .add_packet(au(&[&SPS, &PPS, &IDR]), 1000, true, 0)
+            .unwrap();
+        let a = primary.flush_segment().unwrap().unwrap();
+        let manifest = primary.finalize().unwrap();
+        let mut helper = open(2, false);
+        helper
+            .add_packet(au(&[&SPS, &PPS_CHANGED, &IDR]), 1000, true, 1)
+            .unwrap();
+        let b = helper.flush_segment().unwrap().unwrap();
+        helper.finalize().unwrap();
+
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "no file on disk"
+        );
+        let seg = out.read(&a.path).unwrap();
+        assert_eq!(
+            seg.len() as u64,
+            a.byte_size,
+            "the manifest counts rivet's bytes"
+        );
+        assert_eq!(&seg[4..8], b"moof");
+
+        let init = &manifest.init_path;
+        let settled =
+            settle_video_sample_entry_with(out.as_ref(), init, &[a.path, b.path]).unwrap();
+        assert_eq!(
+            settled,
+            Some(*b"avc3"),
+            "read and rewritten through the output fs"
+        );
+        let bytes = out.read(init).unwrap();
+        let e = video_sample_entry(&bytes).unwrap();
+        assert_eq!(&bytes[e.start + 4..e.start + 8], b"avc3");
+        assert!(
+            mem.files
+                .lock()
+                .unwrap()
+                .values()
+                .all(|stored| !stored.windows(4).any(|w| w == b"moof")),
+            "stored transformed, as an encrypting fs would"
         );
     }
 }

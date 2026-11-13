@@ -19,6 +19,7 @@ pub mod mpeg_es;
 pub mod mux;
 pub mod nal_mux;
 pub mod ogg;
+pub mod output_fs;
 pub mod ps;
 pub mod raw_audio;
 pub mod reorder;

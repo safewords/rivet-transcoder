@@ -131,6 +131,17 @@ pub fn write_webvtt_rendition(
     track: &SubtitleTrack,
     grid: &CmafTrackManifest,
 ) -> Result<WebVttManifest> {
+    write_webvtt_rendition_with(&crate::output_fs::StdFs, dir, track, grid)
+}
+
+/// [`write_webvtt_rendition`], storing the segments through `out` — see
+/// [`crate::output_fs`].
+pub fn write_webvtt_rendition_with(
+    out: &dyn crate::output_fs::OutputFs,
+    dir: &Path,
+    track: &SubtitleTrack,
+    grid: &CmafTrackManifest,
+) -> Result<WebVttManifest> {
     fs::create_dir_all(dir).with_context(|| format!("creating subtitle dir {}", dir.display()))?;
     let mut segments = Vec::with_capacity(grid.segments.len());
     let mut at: u64 = 0;
@@ -140,7 +151,7 @@ pub fn write_webvtt_rendition(
         at = seg_end;
         let body = render_segment(track, seg_start, seg_end, grid.timescale);
         let path: PathBuf = dir.join(format!("seg-{:05}.vtt", i + 1));
-        crate::atomic::write_atomic(&path, body.as_bytes())
+        out.write(&path, body.as_bytes())
             .with_context(|| format!("writing subtitle segment {}", path.display()))?;
         segments.push(SegmentInfo {
             sequence_number: (i + 1) as u32,
@@ -337,5 +348,35 @@ mod tests {
             (1, 1, 1),
             "cue 'one' straddles 4 s, so it is in segments 1 and 2"
         );
+    }
+
+    #[test]
+    fn a_rendition_through_an_output_fs_never_touches_the_disk() {
+        use crate::output_fs::{OutputFs, tests::MemFs};
+        let dir = tempfile::tempdir().unwrap();
+        let grid = CmafTrackManifest {
+            init_path: dir.path().join("init.mp4"),
+            segments: vec![SegmentInfo {
+                sequence_number: 1,
+                path: dir.path().join("seg-00001.m4s"),
+                byte_size: 1,
+                duration_ticks: 120_000,
+            }],
+            timescale: 30_000,
+        };
+        let out = MemFs::default();
+        let subs = dir.path().join("subs");
+        let t = track(vec![cue(1_000, 1_000, "one")]);
+        let m = write_webvtt_rendition_with(&out, &subs, &t, &grid).unwrap();
+        assert_eq!(fs::read_dir(&subs).unwrap().count(), 0, "no file on disk");
+        let body = out.read(&m.segments[0].path).unwrap();
+        assert_eq!(
+            m.segments[0].byte_size,
+            body.len() as u64,
+            "the manifest counts rivet's bytes"
+        );
+        let (magic, _, cues) = parse(std::str::from_utf8(&body).unwrap());
+        assert!(magic);
+        assert_eq!(cues.len(), 1);
     }
 }

@@ -27,9 +27,9 @@
 
 use anyhow::{Context, Result};
 use std::fs;
-use std::io::Write;
 
-use crate::atomic::AtomicFile;
+use crate::output_fs::{OutputFs, StdFs};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::cmaf::CmafTrackManifest;
@@ -173,6 +173,26 @@ pub fn write_hls_package(
     subtitles: &[SubtitleVariantSpec],
     target_duration_seconds: u32,
 ) -> Result<HlsManifestPaths> {
+    write_hls_package_with(
+        &StdFs,
+        output_dir,
+        video_variants,
+        audio,
+        subtitles,
+        target_duration_seconds,
+    )
+}
+
+/// [`write_hls_package`], storing the playlists through `out` — see
+/// [`crate::output_fs`].
+pub fn write_hls_package_with(
+    out: &dyn OutputFs,
+    output_dir: &Path,
+    video_variants: &[VideoVariantSpec],
+    audio: &[AudioVariantSpec],
+    subtitles: &[SubtitleVariantSpec],
+    target_duration_seconds: u32,
+) -> Result<HlsManifestPaths> {
     fs::create_dir_all(output_dir)
         .with_context(|| format!("creating HLS output dir: {}", output_dir.display()))?;
 
@@ -183,7 +203,7 @@ pub fn write_hls_package(
         fs::create_dir_all(&dir)
             .with_context(|| format!("creating video variant dir: {}", dir.display()))?;
         let path = dir.join("playlist.m3u8");
-        write_media_playlist(&path, &v.manifest, target_duration_seconds)
+        write_media_playlist(out, &path, &v.manifest, target_duration_seconds)
             .with_context(|| format!("writing video media playlist: {}", path.display()))?;
         video_playlist_paths.push(path);
     }
@@ -195,7 +215,7 @@ pub fn write_hls_package(
         fs::create_dir_all(&audio_dir)
             .with_context(|| format!("creating audio variant dir: {}", audio_dir.display()))?;
         let path = audio_dir.join("audio.m3u8");
-        write_media_playlist(&path, &a.manifest, target_duration_seconds)
+        write_media_playlist(out, &path, &a.manifest, target_duration_seconds)
             .with_context(|| format!("writing audio media playlist: {}", path.display()))?;
         audio_playlist_paths.push(path);
     }
@@ -208,7 +228,7 @@ pub fn write_hls_package(
         fs::create_dir_all(&dir)
             .with_context(|| format!("creating subtitle rendition dir: {}", dir.display()))?;
         let path = dir.join("subtitles.m3u8");
-        write_subtitle_media_playlist(&path, &s.manifest, target_duration_seconds)
+        write_subtitle_media_playlist(out, &path, &s.manifest, target_duration_seconds)
             .with_context(|| format!("writing subtitle media playlist: {}", path.display()))?;
         subtitle_playlist_paths.push(path);
     }
@@ -216,7 +236,7 @@ pub fn write_hls_package(
     // Master playlist last so its existence is the "all done" signal
     // for any external watcher polling for the asset to appear.
     let master_path = output_dir.join("master.m3u8");
-    write_master_playlist(&master_path, video_variants, audio, subtitles)
+    write_master_playlist(out, &master_path, video_variants, audio, subtitles)
         .with_context(|| format!("writing master playlist: {}", master_path.display()))?;
 
     Ok(HlsManifestPaths {
@@ -244,11 +264,12 @@ pub fn write_hls_package(
 /// itself. CMAF muxers write into the variant's directory by
 /// construction so this resolves cleanly without any path computation.
 fn write_media_playlist(
+    fs: &dyn OutputFs,
     path: &Path,
     manifest: &CmafTrackManifest,
     target_duration_seconds: u32,
 ) -> Result<()> {
-    write_media_playlist_of(path, manifest, target_duration_seconds, false)
+    write_media_playlist_of(fs, path, manifest, target_duration_seconds, false)
 }
 
 /// A media playlist for a rendition still being written: an `EVENT`
@@ -261,7 +282,18 @@ pub fn write_live_media_playlist(
     manifest: &CmafTrackManifest,
     target_duration_seconds: u32,
 ) -> Result<()> {
-    write_media_playlist_of(path, manifest, target_duration_seconds, true)
+    write_live_media_playlist_with(&StdFs, path, manifest, target_duration_seconds)
+}
+
+/// [`write_live_media_playlist`], storing the playlist through `out` — see
+/// [`crate::output_fs`].
+pub fn write_live_media_playlist_with(
+    out: &dyn OutputFs,
+    path: &Path,
+    manifest: &CmafTrackManifest,
+    target_duration_seconds: u32,
+) -> Result<()> {
+    write_media_playlist_of(out, path, manifest, target_duration_seconds, true)
 }
 
 /// The master playlist of a package still being written (a live job's,
@@ -272,16 +304,28 @@ pub fn write_live_master_playlist(
     video_variants: &[VideoVariantSpec],
     audio: &[AudioVariantSpec],
 ) -> Result<()> {
-    write_master_playlist(path, video_variants, audio, &[])
+    write_live_master_playlist_with(&StdFs, path, video_variants, audio)
+}
+
+/// [`write_live_master_playlist`], storing the playlist through `out` — see
+/// [`crate::output_fs`].
+pub fn write_live_master_playlist_with(
+    out: &dyn OutputFs,
+    path: &Path,
+    video_variants: &[VideoVariantSpec],
+    audio: &[AudioVariantSpec],
+) -> Result<()> {
+    write_master_playlist(out, path, video_variants, audio, &[])
 }
 
 fn write_media_playlist_of(
+    fs: &dyn OutputFs,
     path: &Path,
     manifest: &CmafTrackManifest,
     target_duration_seconds: u32,
     live: bool,
 ) -> Result<()> {
-    let mut w = AtomicFile::create(path)?;
+    let mut w: Vec<u8> = Vec::new();
 
     writeln!(w, "#EXTM3U")?;
     writeln!(w, "#EXT-X-VERSION:7")?;
@@ -318,7 +362,7 @@ fn write_media_playlist_of(
     if !live {
         writeln!(w, "#EXT-X-ENDLIST")?;
     }
-    w.commit()?;
+    fs.write(path, &w)?;
     Ok(())
 }
 
@@ -328,11 +372,12 @@ fn write_media_playlist_of(
 /// video grid the rendition was segmented on, so they match the video
 /// playlist's line for line.
 fn write_subtitle_media_playlist(
+    fs: &dyn OutputFs,
     path: &Path,
     manifest: &WebVttManifest,
     target_duration_seconds: u32,
 ) -> Result<()> {
-    let mut w = AtomicFile::create(path)?;
+    let mut w: Vec<u8> = Vec::new();
     writeln!(w, "#EXTM3U")?;
     writeln!(w, "#EXT-X-VERSION:7")?;
     writeln!(w, "#EXT-X-TARGETDURATION:{}", target_duration_seconds)?;
@@ -348,7 +393,7 @@ fn write_subtitle_media_playlist(
         writeln!(w, "{name}")?;
     }
     writeln!(w, "#EXT-X-ENDLIST")?;
-    w.commit()?;
+    fs.write(path, &w)?;
     Ok(())
 }
 
@@ -369,15 +414,14 @@ fn write_subtitle_media_playlist(
 /// linearly and pick the first variant that fits, so the order
 /// matters in practice.
 fn write_master_playlist(
+    fs: &dyn OutputFs,
     path: &Path,
     video_variants: &[VideoVariantSpec],
     audio: &[AudioVariantSpec],
     subtitles: &[SubtitleVariantSpec],
 ) -> Result<()> {
     let body = render_master_playlist_to_string(video_variants, audio, subtitles);
-    let mut w = AtomicFile::create(path)?;
-    w.write_all(body.as_bytes())?;
-    w.commit()?;
+    fs.write(path, body.as_bytes())?;
     Ok(())
 }
 
@@ -525,7 +569,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("playlist.m3u8");
         let manifest = synth_manifest(30000, &[120_000, 120_000, 120_000]);
-        write_media_playlist(&path, &manifest, 4).unwrap();
+        write_media_playlist(&StdFs, &path, &manifest, 4).unwrap();
         let body = fs::read_to_string(&path).unwrap();
         assert!(body.starts_with("#EXTM3U\n"));
         assert!(body.contains("#EXT-X-VERSION:7\n"));
@@ -539,12 +583,73 @@ mod tests {
     }
 
     #[test]
+    fn playlists_go_through_the_output_fs() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = crate::output_fs::tests::MemFs::default();
+        let manifest = synth_manifest(30000, &[120_000, 120_000]);
+        let v = VideoVariantSpec {
+            width: 640,
+            height: 360,
+            frame_rate: 30.0,
+            average_bandwidth_bps: 1,
+            bandwidth_bps: 1,
+            codec_string: "av01.0.04M.08".into(),
+            supplemental_codecs: None,
+            video_range: None,
+            relative_dir: "video/360p".into(),
+            manifest,
+        };
+        let paths = write_hls_package_with(&out, dir.path(), &[v], &[], &[], 4).unwrap();
+        let body = String::from_utf8(out.read(&paths.master_path).unwrap()).unwrap();
+        assert!(body.starts_with("#EXTM3U"), "{body}");
+        let variant = String::from_utf8(out.read(&paths.video_playlist_paths[0]).unwrap()).unwrap();
+        assert!(variant.contains("seg-00002.m4s"));
+        assert!(
+            !paths.master_path.exists(),
+            "nothing written to the disk itself"
+        );
+    }
+
+    #[test]
+    fn live_playlists_go_through_the_output_fs() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = crate::output_fs::tests::MemFs::default();
+        let manifest = synth_manifest(30000, &[120_000, 120_000]);
+        let media = dir.path().join("playlist.m3u8");
+        write_live_media_playlist_with(&out, &media, &manifest, 4).unwrap();
+        let body = String::from_utf8(out.read(&media).unwrap()).unwrap();
+        assert!(body.contains("#EXT-X-PLAYLIST-TYPE:EVENT\n"), "{body}");
+        assert!(!body.contains("#EXT-X-ENDLIST"), "still being written");
+        let v = VideoVariantSpec {
+            width: 640,
+            height: 360,
+            frame_rate: 30.0,
+            average_bandwidth_bps: 1,
+            bandwidth_bps: 1,
+            codec_string: "av01.0.04M.08".into(),
+            supplemental_codecs: None,
+            video_range: None,
+            relative_dir: "video/360p".into(),
+            manifest,
+        };
+        let master = dir.path().join("master.m3u8");
+        write_live_master_playlist_with(&out, &master, &[v], &[]).unwrap();
+        let body = String::from_utf8(out.read(&master).unwrap()).unwrap();
+        assert!(body.contains("video/360p/playlist.m3u8"), "{body}");
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "nothing written to the disk itself"
+        );
+    }
+
+    #[test]
     fn media_playlist_uses_real_segment_durations_not_nominal() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("playlist.m3u8");
         // Three segments of slightly different durations (last one short).
         let manifest = synth_manifest(30000, &[120_000, 120_000, 87_500]);
-        write_media_playlist(&path, &manifest, 4).unwrap();
+        write_media_playlist(&StdFs, &path, &manifest, 4).unwrap();
         let body = fs::read_to_string(&path).unwrap();
         // 87500 / 30000 = 2.9166666...
         assert!(body.contains("#EXTINF:2.916667,"), "got: {body}");
@@ -605,6 +710,7 @@ mod tests {
 
         // Pass them in REVERSE bandwidth order to verify sorting.
         write_master_playlist(
+            &StdFs,
             &path,
             &[v1080, v720, v480],
             std::slice::from_ref(&audio),
@@ -653,7 +759,7 @@ mod tests {
             name: "Default".into(),
             manifest: synth_manifest(48000, &[192_000]),
         };
-        write_master_playlist(&path, &[v], std::slice::from_ref(&audio), &[]).unwrap();
+        write_master_playlist(&StdFs, &path, &[v], std::slice::from_ref(&audio), &[]).unwrap();
         let body = fs::read_to_string(&path).unwrap();
 
         assert!(body.starts_with("#EXTM3U"));
@@ -754,7 +860,7 @@ mod tests {
             relative_dir: "video/1080p".into(),
             manifest: video_manifest,
         };
-        write_master_playlist(&path, &[v], &[], &[]).unwrap();
+        write_master_playlist(&StdFs, &path, &[v], &[], &[]).unwrap();
         let body = fs::read_to_string(&path).unwrap();
 
         assert!(body.starts_with("#EXTM3U"));
@@ -957,8 +1063,13 @@ mod tests {
     fn subtitle_media_playlist_has_no_map_and_mirrors_the_grid() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("subtitles.m3u8");
-        write_subtitle_media_playlist(&path, &synth_vtt(30000, &[120_000, 120_000, 87_500]), 4)
-            .unwrap();
+        write_subtitle_media_playlist(
+            &StdFs,
+            &path,
+            &synth_vtt(30000, &[120_000, 120_000, 87_500]),
+            4,
+        )
+        .unwrap();
         let body = fs::read_to_string(&path).unwrap();
         let (tags, uris) = parse_playlist(&body);
         assert_eq!(tags[0].0, "EXTM3U");

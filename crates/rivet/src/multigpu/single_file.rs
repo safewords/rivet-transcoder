@@ -262,6 +262,7 @@ pub async fn run_multigpu_single_file(
         output_root: params.output_root.clone(),
         constant_qp: params.constant_qp,
         video_delay_ticks: params.video_delay_ticks,
+        output_fs: params.output_fs.clone(),
     };
     // A unit of single-file work: one chunk → its packets, in memory.
     let encode: Arc<dyn EncodeUnit<ChunkPackets>> = Arc::new(
