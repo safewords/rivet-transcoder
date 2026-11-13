@@ -162,6 +162,7 @@ pub(super) async fn run_hls(
         constant_qp: false,
         cancel: None,
         video_delay_ticks: container::edit::rescale_round(video_delay.0, timescale, video_delay.1),
+        output_fs: container::output_fs::std_fs(),
     };
     let manifests = multigpu::run_multigpu_hls(params, Arc::clone(&sink)).await?;
 

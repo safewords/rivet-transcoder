@@ -224,6 +224,12 @@ pub struct MultiGpuParams<'a> {
     /// ordinary source. Unused by the single-file path, whose muxer writes the
     /// delay as an edit list.
     pub video_delay_ticks: u64,
+    /// Where the HLS path's init and segment files are stored
+    /// ([`container::output_fs`]); `container::output_fs::std_fs()` for the
+    /// plain filesystem. Whatever reads the rungs back — the `CODECS` string,
+    /// an uploader — must read through the same one. Unused by the
+    /// single-file path, which writes nothing per chunk.
+    pub output_fs: container::output_fs::SharedOutputFs,
 }
 
 impl MultiGpuParams<'_> {
@@ -334,6 +340,8 @@ pub(super) struct WorkerCtx {
     pub(super) constant_qp: bool,
     /// [`MultiGpuParams::video_delay_ticks`]: every CMAF segment's decode-time offset.
     pub(super) video_delay_ticks: u64,
+    /// [`MultiGpuParams::output_fs`].
+    pub(super) output_fs: container::output_fs::SharedOutputFs,
 }
 
 /// Periodic per-rung progress reporter. Reads the shared frame counters and
@@ -552,6 +560,7 @@ pub(super) mod test_support {
             constant_qp: false,
             cancel: None,
             video_delay_ticks: 0,
+            output_fs: container::output_fs::std_fs(),
         }
     }
 }

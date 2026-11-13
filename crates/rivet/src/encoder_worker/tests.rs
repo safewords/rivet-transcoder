@@ -30,6 +30,7 @@ fn config_clone_preserves_fields() {
         base_decode_time_offset: 0,
         output_dir: PathBuf::from("/tmp/x"),
         rung_invariant: Arc::new(RwLock::new(None)),
+        output_fs: container::output_fs::std_fs(),
     };
     let copy = cfg.clone();
     assert_eq!(copy.rung_idx, 2);

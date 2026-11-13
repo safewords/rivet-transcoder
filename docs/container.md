@@ -51,6 +51,8 @@ container-crate companion — what each file does and *why*.
 | [`cmaf/`](../crates/container/src/cmaf/mod.rs) | Fragmented-MP4 / CMAF segment writers (`moof`/`mfhd`/`tfhd`/`tfdt`/`trun`), init segments, the stateful `CmafVideoMuxer` / `CmafAudioMuxer`, and `settle_video_sample_entry`. |
 | [`hls.rs`](../crates/container/src/hls.rs) | HLS playlist generation: `master.m3u8` + per-variant media playlist + shared audio rendition group. |
 | [`webvtt.rs`](../crates/container/src/webvtt.rs) | Segmented WebVTT for HLS subtitle renditions. |
+| [`output_fs.rs`](../crates/container/src/output_fs.rs) | `OutputFs`: how the files of a CMAF / HLS package are stored. Every segment, init segment, WebVTT segment and playlist is written whole through one and read back through the same one (`with_output_fs` on the muxers, the `_with` forms of `write_hls_package`, the live playlist writers, `settle_video_sample_entry` and `write_webvtt_rendition`). The default, `StdFs`, is the filesystem by way of `atomic.rs`; a caller that must not leave a package readable on its disk supplies its own. |
+| [`atomic.rs`](../crates/container/src/atomic.rs) | Output files that appear whole or not at all: a temporary file beside the target, renamed over it once complete. |
 | [`aac_asc.rs`](../crates/container/src/aac_asc.rs) | AAC `AudioSpecificConfig` parse + implicit→explicit HE-AAC signaling rewrite. |
 | [`ac3_sync.rs`](../crates/container/src/ac3_sync.rs) | AC-3 / E-AC-3 sync-frame / BSI parse → `dac3` / `dec3` config fields. |
 | [`dts_sync.rs`](../crates/container/src/dts_sync.rs) | DTS core frame header parse → the `ddts` body. |
