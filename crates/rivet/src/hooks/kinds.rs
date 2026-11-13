@@ -282,35 +282,59 @@ macro_rules! register {
 impl Hooks {
     register!(
         /// Register a [`SourceHook`]: the source bytes, before parsing.
-        source, source_with, SourceHook, SourceAdapter
+        source,
+        source_with,
+        SourceHook,
+        SourceAdapter
     );
     register!(
         /// Register a [`ProbeHook`]: the source's description.
-        probe, probe_with, ProbeHook, ProbeAdapter
+        probe,
+        probe_with,
+        ProbeHook,
+        ProbeAdapter
     );
     register!(
         /// Register a [`DecodedFrameHook`]: video frames as decoded.
-        decoded_frames, decoded_frames_with, DecodedFrameHook, DecodedFrameAdapter
+        decoded_frames,
+        decoded_frames_with,
+        DecodedFrameHook,
+        DecodedFrameAdapter
     );
     register!(
         /// Register an [`EncoderFrameHook`]: video frames as the encoders receive them.
-        encoder_frames, encoder_frames_with, EncoderFrameHook, EncoderFrameAdapter
+        encoder_frames,
+        encoder_frames_with,
+        EncoderFrameHook,
+        EncoderFrameAdapter
     );
     register!(
         /// Register a [`StillHook`]: still pictures in an image job.
-        stills, stills_with, StillHook, StillAdapter
+        stills,
+        stills_with,
+        StillHook,
+        StillAdapter
     );
     register!(
         /// Register an [`ArtifactHook`]: the job's outputs of the kinds it accepts.
-        artifacts, artifacts_with, ArtifactHook, ArtifactAdapter
+        artifacts,
+        artifacts_with,
+        ArtifactHook,
+        ArtifactAdapter
     );
     register!(
         /// Register a [`CompletedHook`]: the job finished.
-        completed, completed_with, CompletedHook, CompletedAdapter
+        completed,
+        completed_with,
+        CompletedHook,
+        CompletedAdapter
     );
     register!(
         /// Register a [`FailedHook`]: the job failed.
-        failed, failed_with, FailedHook, FailedAdapter
+        failed,
+        failed_with,
+        FailedHook,
+        FailedAdapter
     );
 }
 
