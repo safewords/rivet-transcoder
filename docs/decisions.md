@@ -1384,24 +1384,31 @@ not two.
   true any more. The encoder writes the colour description and HDR10
   metadata, so HDR AV1 works on a CPU-only build; the decoder is threaded
   and has SIMD (60 to 70 megapixels a second on one thread on the encoder's
-  own 720p and 1080p output). And since rivet-av1 `a328e71` (taken
-  2026-11-14) the encoder is at parity with rav1e 0.8.1 at rav1e's own
-  one-thread time. On five standard clips (foreman, mobile, akiyo,
-  ducks_take_off, park_joy; 30 frames, quantisers 64 to 192, one thread, the
-  same speed in both), BD-rate against rav1e in PSNR-Y (PSNR-YUV in
-  brackets), negative favouring rivet-av1: speed 4 (`archive`) −2.5 %
-  (+2.8 %) at 0.99x rav1e's time, speed 6 (`standard`) −3.2 % (+2.1 %) at
-  about 0.94x, speed 8 (`draft`) −2.8 % (+2.5 %) at about 0.98x (the speed 6
-  and 8 times are estimates from the crate's step-by-step measurements).
-  rivet-av1 leads in luma and trails slightly once chroma counts, because
-  rav1e codes chroma with a much finer quantiser than luma. On all threads
+  own 720p and 1080p output). And since rivet-av1 `59692ff` (taken
+  2026-11-14) the encoder is ahead of rav1e 0.8.1 at every tier, in luma and
+  with chroma counted, at or under rav1e's own one-thread time. On five
+  standard clips (foreman, mobile, akiyo, ducks_take_off, park_joy; 30
+  frames, quantisers 64 to 192, one thread, the same speed in both, one
+  encode at a time interleaved with rav1e), BD-rate against rav1e in PSNR-Y
+  (PSNR-YUV in brackets), negative favouring rivet-av1: speed 4 (`archive`)
+  −4.65 % (−0.18 %) at 0.997x rav1e's time, speed 6 (`standard`) −5.38 %
+  (−0.86 %) at 0.982x, speed 8 (`draft`) −4.67 % (−0.37 %) at 0.973x. The
+  lead is wide in luma and narrow once chroma counts, because rav1e codes
+  chroma with a much finer quantiser than luma; foreman still trails at
+  every tier (the crate's README, "Not there yet"). (At `a328e71`, the first
+  bump at parity, it was −2.5 % (+2.8 %), −3.2 % (+2.1 %) and −2.8 %
+  (+2.5 %): behind in PSNR-YUV. Angle deltas, smaller blocks in the frames
+  others refer to, a two-stage CDEF search, the Wiener filter at speeds 4 to
+  6 and a fourth inter candidate at speed 4 closed it.) On all threads
   it is several times faster than rav1e at speeds 6 and 8, since it searches
   a one-tile frame's superblock rows in a wavefront and rav1e gains little
   from threads on one tile. What made the difference was the encoder's own
   work: alt-ref groups of 16 frames, rate-distortion optimised quantisation,
   chroma weighting and trials, the inter tools (switchable filters, OBMC,
   local warps) and each speed's search set to what rav1e spends at that
-  speed. The cost a caller sees is delay: frames are held a group at a time
+  speed. The cost a caller sees is delay: frames are held a group at a time,
+  and with a bitrate the key frame too, planned with the group after it so
+  that a short clip or a segment is on its rate from its first group
   ([codec-encode.md](codec-encode.md#software-av1--encodeav1_swrs)).
 - Verification is rivet's own throughout: the AV1, VP9 and image outputs are
   read back with rivet's demuxers and decoded with rivet's decoders

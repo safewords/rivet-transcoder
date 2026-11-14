@@ -202,17 +202,18 @@ Open:
       throughput_at_720p`. Left: the adapter does not yet use
       `Decoder::set_frames_in_flight`, which a one-tile stream needs to use
       more than two or three threads.
-- [x] **Encode speed and quality** (rivet-av1 `a328e71`, 2026-11-14). It was
+- [x] **Encode speed and quality** (rivet-av1 `59692ff`, 2026-11-14). It was
       about 10 fps at 352x288 and 2 fps at 1280x720 on one thread, one tile,
       and below rav1e's quality at the same quantiser. Now each tier spends
-      what rav1e spends at its speed and codes fewer bits than rav1e at the
-      same PSNR-Y: against rav1e 0.8.1 on five standard clips (30 frames, one
-      thread), BD-rate PSNR-Y (PSNR-YUV) −2.5 % (+2.8 %) at speed 4 for
-      0.99x rav1e's time, −3.2 % (+2.1 %) at speed 6 for about 0.94x, −2.8 %
-      (+2.5 %) at speed 8 for about 0.98x; on all threads it is several times
-      faster than rav1e at speeds 6 and 8. Left: PSNR-YUV, 2 % to 3 % behind,
-      which is in how chroma is searched and quantised (the crate's README,
-      "Not there yet").
+      at most what rav1e spends at its speed and codes fewer bits than rav1e
+      at the same PSNR-Y and at the same PSNR-YUV: against rav1e 0.8.1 on five
+      standard clips (30 frames, one thread), BD-rate PSNR-Y (PSNR-YUV)
+      −4.65 % (−0.18 %) at speed 4 for 0.997x rav1e's time, −5.38 % (−0.86 %)
+      at speed 6 for 0.982x, −4.67 % (−0.37 %) at speed 8 for 0.973x; on all
+      threads it is several times faster than rav1e at speeds 6 and 8. Left:
+      the margin in PSNR-YUV is thin, and foreman trails at every tier
+      (+3 % to +4 % PSNR-Y, +6 % PSNR-YUV, mostly V; the crate's README, "Not
+      there yet").
 - [x] **HDR AV1 in software.** The encoder writes the colour description into
       the sequence header and HDR10 mastering display and content light
       level into metadata OBUs on every key frame, so HDR10 / HLG AV1 works on

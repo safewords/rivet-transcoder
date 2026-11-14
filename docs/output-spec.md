@@ -660,7 +660,7 @@ let dvdish = OutputSpec::single_file(rungs).with_video_codec(VideoCodecPolicy::M
 
 | Codec | Single file (default first) | HLS | Encoder | Depth / colour |
 |---|---|---|---|---|
-| AV1 (default) | MP4 | yes | NVENC / AMF / QSV, rivet's own (`crates/av1`, `av1-sw-fallback`) | 8- / 10-bit; HDR on the GPUs only |
+| AV1 (default) | MP4 | yes | NVENC / AMF / QSV, rivet's own (`crates/av1`, `av1-sw-fallback`) | 8- / 10-bit + HDR |
 | H.264 | MP4, QuickTime | yes | NVENC / AMF / QSV, h26x (`h26x-fallback`) | 8-bit; 10-bit + HDR in software |
 | H.265 | MP4, QuickTime | yes | NVENC / AMF / QSV, h26x (`h26x-fallback`) | 8- / 10-bit + HDR |
 | VP9 | WebM, MP4 | yes | rivet's own (`crates/vp9`), every build | profile 0 (8-bit) or 2 (10-bit, `--pixel-format 10bit`), 4:2:0, SDR |

@@ -275,23 +275,23 @@ and it says so at `warn` when it does.
   chosen by rate-distortion optimised quantisation. (The crate also codes
   4:2:2, 4:4:4, 12-bit, monochrome, lossless and film grain; rivet's adapter
   asks for none of them yet.)
-- **How well, against rav1e.** rivet-av1 at `a328e71` against rav1e 0.8.1
+- **How well, against rav1e.** rivet-av1 at `59692ff` against rav1e 0.8.1
   (run as a black box), on five standard clips (foreman, mobile and akiyo at
   352x288, ducks_take_off and park_joy at 1280x720; 30 frames, quantisers 64
-  to 192, one thread, the same speed in both). BD-rate is the change in bits
-  at the same PSNR, PSNR-Y with PSNR-YUV in brackets; negative favours
-  rivet-av1:
+  to 192, one thread, the same speed in both, one encode at a time
+  interleaved with rav1e). BD-rate is the change in bits at the same PSNR,
+  PSNR-Y with PSNR-YUV in brackets; negative favours rivet-av1:
 
   | tier (speed) | BD-rate | one-thread time against rav1e |
   |---|---|---|
-  | `archive` (4) | −2.5 % (+2.8 %) | 0.99x |
-  | `standard` (6) | −3.2 % (+2.1 %) | about 0.94x |
-  | `draft` (8) | −2.8 % (+2.5 %) | about 0.98x |
+  | `archive` (4) | −4.65 % (−0.18 %) | 0.997x |
+  | `standard` (6) | −5.38 % (−0.86 %) | 0.982x |
+  | `draft` (8) | −4.67 % (−0.37 %) | 0.973x |
 
-  So at rav1e's time the encoder is at parity: ahead in luma, a little behind
-  once chroma counts, because rav1e codes chroma with a much finer quantiser
-  than luma. The `standard` and `draft` times are estimates from the crate's
-  step-by-step measurements, not a final interleaved run. On all threads
+  So at or under rav1e's time the encoder is ahead at every tier: by about
+  5 % in luma and by under 1 % once chroma counts, because rav1e codes
+  chroma with a much finer quantiser than luma. foreman still trails at every
+  tier (+3 % to +4 % PSNR-Y). On all threads
   rivet-av1 is several times faster than rav1e at speeds 6 and 8, because its
   wavefront search spreads a one-tile frame over the threads and rav1e gains
   little from them on one tile. These are the crate's numbers, measured with
@@ -306,7 +306,20 @@ and it says so at `warn` when it does.
   is planned over the next frames from a rate model refitted after every
   frame, the source's complexity measured before the frame is coded (so a
   scene cut is priced before it is spent), over- and under-spending repaid
-  over 12 frames. Over ten seconds of 640x360 at 100, 300 and 1000 kb/s it
+  over 12 frames. In alt-ref groups the complexities come from a lookahead
+  on the group's sources, and the key frame is planned with the group after
+  it (and held until that group is in: see the delay below), so a short clip
+  or a segment coded on its own is on its rate from its first group: the
+  crate's short clips (24 and 40 frames, CIF and 720p, natural and noisy)
+  and 4-second segments land within 5 % of the rate, their first 17 frames
+  within 4.4 % (before rivet-av1 `64dd6c3`, −50 % to +355 %). Through this
+  adapter at the `standard` tier (2026-11-14, 30 to 60 frames, a frame rate
+  of 30): foreman at 300 and 1000 kb/s 0.987x and 1.003x, mobile at 1000
+  kb/s 1.004x, ducks_take_off and park_joy (640x360 crops) at 1000 and 3000
+  kb/s 0.998x each, noise at 100 kb/s 0.979x; the first 17 frames within
+  2.2 % of the rate; `bframes=0` within 2 % over the clip and 2 % to 14 %
+  over the first 17 frames, which it repays after. Over ten seconds of
+  640x360 at 100, 300 and 1000 kb/s it
   lands within 2.5 % on a fast pan, fresh noise in every frame and a new
   scene every second, at speeds 4, 6 and 8 (a still frame within 7 %, until
   it cannot use the bits: 1000 kb/s is more than a still scene takes at
@@ -338,7 +351,11 @@ and it says so at `warn` when it does.
   later by a `show_existing_frame` in the temporal unit of its turn. It holds
   a group's frames until the last one is sent, so `send_frame` returns no
   packet for up to 16 frames, and the call that completes a group does the
-  whole group's work. The packets still come out one per frame sent and in
+  whole group's work. With a bitrate the key frame is held as well (rate
+  control plans it with the group after it), so the stream's first packet
+  comes with its 17th frame and the packets follow one per frame sent, 16
+  behind; without one the key frame comes out at once and the group after
+  it waits. The packets still come out one per frame sent and in
   display order, so the adapter hands them the timestamps of the frames in
   the order they were sent, and `flush` codes the frames of the last,
   unfinished group: every caller (the single-file path, the chunked path,

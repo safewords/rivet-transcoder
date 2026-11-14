@@ -69,7 +69,13 @@ const ALPHA_URN: &str = "urn:mpeg:mpegB:cicp:systems:auxiliary:alpha";
 /// key frame the encoder codes is now `base_q_idx` 212, so qualities below
 /// about 15 bottom out there. If rivet-av1 changes `KEY_Q`, these must be
 /// worked out again; the crate does not expose the offset or the coded
-/// `base_q_idx`, so no test here can see it move.
+/// `base_q_idx`, so no test here can see it move. Checked at rivet-av1
+/// `59692ff`, which retuned speed 8's search and filters but not `KEY_Q`:
+/// the first frames of foreman, mobile, park_joy and ducks_take_off at
+/// qualities 40 to 98 came out within 1.6 % of `a328e71`'s bytes and
+/// 0.12 dB of its PSNR-Y (on average within 0.4 % and 0.03 dB a quality),
+/// and at quality 20, the smallest files, 1.3 % larger and 0.07 dB better
+/// on average; so the anchors stand.
 pub fn quantizer_for_quality(quality: u8) -> u32 {
     const ANCHORS: [(f32, f32); 9] = [
         (1.0, 255.0),

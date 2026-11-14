@@ -42,7 +42,10 @@
 //! The temporal units still map one to one onto the frames sent, which is
 //! why the packets carry the timestamps of the frames in the order they were
 //! sent (`pending_pts`), and why `flush` must drain the encoder: it codes the
-//! frames of the last, unfinished group. A group never spans a key frame (it
+//! frames of the last, unfinished group. With a bitrate the key frame is held
+//! too: rate control plans it with the group after it (rivet-av1 `64dd6c3`),
+//! so the first packet comes with the 17th frame rather than the first, and
+//! the packets then follow a frame at a time, 16 behind. A group never spans a key frame (it
 //! ends before the next interval key and before a forced one), so every
 //! key frame still opens a stream that stands alone: the chunked path's
 //! stitch, the CMAF worker's segments and the live HLS segments all rely on
@@ -69,8 +72,10 @@
 //! equalised against). A bitrate rung is coded to its average rate by the
 //! encoder's rate controller (bits per frame at the rung's frame rate; each
 //! frame's quantiser planned from a rate model refitted after every frame,
-//! with the source's complexity measured before coding — within a few
-//! percent over ten seconds of still, moving, noisy or cut footage); a
+//! with the source's complexity measured before coding, and in groups from
+//! a lookahead on the group's sources — within a few percent over ten
+//! seconds of still, moving, noisy or cut footage, and from the first group
+//! of a short clip or a segment coded on its own); a
 //! constant rate or a coded picture buffer is refused by name. The speed
 //! tier picks the encoder's effort (`av1::Config::speed`: Draft 8, Standard
 //! 6, Archive 4 — how much of its rate-distortion search runs, and which
@@ -80,9 +85,9 @@
 //!
 //! A rate-distortion-searching encoder in Rust, SIMD in its hot kernels
 //! (its own as well as the decoder's), each speed set to what rav1e spends
-//! at the same speed: at rav1e 0.8.1's one-thread time it codes 2.5 % to
-//! 3.2 % fewer bits at the same PSNR-Y (2.1 % to 2.8 % more at the same
-//! PSNR-YUV). At every tier it searches each frame's superblock rows in a
+//! at the same speed: at or under rav1e 0.8.1's one-thread time it codes
+//! 4.7 % to 5.4 % fewer bits at the same PSNR-Y and 0.2 % to 0.9 % fewer at
+//! the same PSNR-YUV (rivet-av1 `59692ff`). At every tier it searches each frame's superblock rows in a
 //! wavefront on the encoder's threads (one tile column unless `tiles=` asks;
 //! the stream does not depend on the thread count). At the Standard tier
 //! about 5.2 frames/s at 1280x720 on one thread and 13.8
@@ -694,13 +699,16 @@ mod tests {
         )
     }
 
-    /// A bitrate rung lands near its rate, and a higher rate spends more:
-    /// over 40 frames coded as they come (`bframes=0`), and over 200 in
-    /// alt-ref groups. Groups need the longer run: the first group is
-    /// planned before the rate model has seen a coded frame, and on these
-    /// small noisy frames it overspends (1.6x to 2.3x the rate over the
-    /// first 40 frames), which the groups after it repay (within 1 % over
-    /// 200 frames).
+    /// A bitrate rung lands near its rate, and a higher rate spends more,
+    /// over 40 frames both coded as they come (`bframes=0`) and in alt-ref
+    /// groups. Without groups every frame sent is a packet at once, rate
+    /// control or not. With groups and a rate, the encoder plans the key
+    /// frame with the group after it and holds it until that group is in
+    /// (rivet-av1 `64dd6c3`): the first packet comes with the 17th frame
+    /// and the packets follow a frame at a time 16 behind, and the clip's
+    /// first group is on its rate too (before, it was
+    /// planned before the rate model had seen a coded frame, and these
+    /// small noisy frames came out at 1.6x to 2.3x over the first 40).
     #[test]
     fn a_bitrate_rung_is_coded_to_its_rate() {
         let (w, h) = (96, 64);
@@ -717,24 +725,38 @@ mod tests {
                 ..config(w, h)
             };
             let mut enc = Av1Encoder::new(cfg).unwrap();
+            let (mut bits, mut packets) = (0u64, 0u64);
             for i in 0..n {
                 enc.send_frame(&noisy(w, h, i)).unwrap();
+                while let Some(p) = enc.receive_packet().unwrap() {
+                    assert_eq!(p.pts, packets, "display order");
+                    bits += p.data.len() as u64 * 8;
+                    packets += 1;
+                }
+                if bframes == Some(0) {
+                    assert_eq!(packets, i + 1, "frame {i}: a packet as it is sent");
+                } else {
+                    // Nothing until the key frame's group is in, then a
+                    // packet a frame, 16 behind.
+                    assert_eq!(packets, i.saturating_sub(15), "frame {i}: 16 frames held");
+                }
             }
             enc.flush().unwrap();
-            let (mut bits, mut packets) = (0u64, 0u64);
             while let Some(p) = enc.receive_packet().unwrap() {
+                assert_eq!(p.pts, packets, "display order");
                 bits += p.data.len() as u64 * 8;
                 packets += 1;
             }
             assert_eq!(packets, n);
             bits as f64 * 25.0 / n as f64
         };
-        for (bframes, n, close) in [(Some(0), 40, 0.6..1.6), (None, 200, 0.85..1.15)] {
+        for bframes in [Some(0), None] {
+            let n = 40;
             let (low, high) = (achieved(150_000, bframes, n), achieved(400_000, bframes, n));
             for (asked, got) in [(150_000.0, low), (400_000.0, high)] {
                 let ratio = got / asked;
                 assert!(
-                    close.contains(&ratio),
+                    (0.9..1.1).contains(&ratio),
                     "bframes {bframes:?}, {n} frames: asked {asked} b/s, got {got:.0} ({ratio:.2}x)"
                 );
             }

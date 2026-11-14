@@ -482,7 +482,7 @@ rivet transcode input.mkv --codec prores-hq             # -> input.prores.mov
 rivet transcode input.mkv --codec vp9 -o out.webm
 rivet transcode input.mkv --codec mpeg2 --container mov -o out.mov
 
-# HDR10 passthrough (AV1 needs a GPU build with AV1 encode; see Color & bit depth)
+# HDR10 passthrough (AV1 needs a GPU with AV1 encode or av1-sw-fallback; see Color & bit depth)
 rivet transcode input.mkv -o out.mp4 --color hdr10 --pixel-format 10bit
 
 # Splice/trim: cut a single input to [2s, 7s)
