@@ -1154,6 +1154,19 @@ impl<'a> Engine<'a> {
                 ..EncoderConfig::default()
             };
             rung.quality.apply(&mut cfg, fps);
+            // Live AV1 is coded frame in, packet out: no alt-ref groups,
+            // which is what `bframes=0` means to the software AV1 encoder
+            // (and is already every hardware AV1 encoder's default). With
+            // groups that encoder holds 16 frames before its first packet
+            // (a live HLS segment would be published that much later), and
+            // then codes the whole group in one call while this rung's
+            // channel holds only FRAME_CHANNEL_CAPACITY pictures, so a
+            // realtime source backs up into the capture queue and drops
+            // pictures. Without groups AV1 costs about 16 % more bits; a live picture
+            // is worth more on time. A rung that names bframes keeps it.
+            if cfg.codec == codec::frame::VideoCodec::Av1 && cfg.overrides.bframes.is_none() {
+                cfg.overrides.bframes = Some(0);
+            }
             if let Some((_, timing)) = &hls {
                 // Every segment opens on a keyframe.
                 cfg.keyframe_interval =

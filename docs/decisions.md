@@ -1345,7 +1345,9 @@ not two.
   BT.601 matrix, full range) / `auxC` properties; alpha as an auxiliary item
   at three quarters of the colour quantiser; image quality 1–100 mapped to
   `base_q_idx` through anchors (1→255, 20→205, 40→162, 60→120, 80→72, 90→44,
-  100→1); 8-bit 4:2:0, no ICC (so AVIF output is converted to sRGB, as
+  100→1; since rivet-av1 `a328e71` codes key frames 1.2 octaves finer than
+  the quantiser it is given, the encoder is given the quantisers that code
+  those values, `avif::quantizer_for_quality`); 8-bit 4:2:0, no ICC (so AVIF output is converted to sRGB, as
   before). A picture over 2048x2048, or wider than the encoder's 4096, is
   written as a `grid` of equal tiles of at most 2048 pixels, encoded in
   parallel — which is also the only parallelism the single-tile encoder gets.
@@ -1373,12 +1375,34 @@ not two.
 **Consequences.**
 - No codec in a default or `image` build is third-party, and no feature
   needs a C compiler.
-- Regressions, stated plainly: software AV1 encode is slower and codes worse than rav1e did at the same
-  quantiser (about 10 fps at 352x288 and 2 fps at 1280x720, single tile, no
-  assembly); software AV1 decode is bounded at about 6 megapixels a second on
-  full-toolbox streams; HDR10 / HLG AV1 still
-  needs a GPU (10-bit SDR AV1 now works on a CPU-only build with
-  `av1-sw-fallback`, which rav1e could not do).
+- Regressions, stated plainly at the time: the first software AV1 encoder
+  was slower and coded worse than rav1e at the same quantiser (about 10 fps
+  at 352x288 and 2 fps at 1280x720, single tile, no assembly), software AV1
+  decode was bounded at about 6 megapixels a second on full-toolbox streams,
+  and HDR10 / HLG AV1 needed a GPU (10-bit SDR AV1 worked on a CPU-only build
+  with `av1-sw-fallback`, which rav1e could not do). None of the three is
+  true any more. The encoder writes the colour description and HDR10
+  metadata, so HDR AV1 works on a CPU-only build; the decoder is threaded
+  and has SIMD (60 to 70 megapixels a second on one thread on the encoder's
+  own 720p and 1080p output). And since rivet-av1 `a328e71` (taken
+  2026-11-14) the encoder is at parity with rav1e 0.8.1 at rav1e's own
+  one-thread time. On five standard clips (foreman, mobile, akiyo,
+  ducks_take_off, park_joy; 30 frames, quantisers 64 to 192, one thread, the
+  same speed in both), BD-rate against rav1e in PSNR-Y (PSNR-YUV in
+  brackets), negative favouring rivet-av1: speed 4 (`archive`) −2.5 %
+  (+2.8 %) at 0.99x rav1e's time, speed 6 (`standard`) −3.2 % (+2.1 %) at
+  about 0.94x, speed 8 (`draft`) −2.8 % (+2.5 %) at about 0.98x (the speed 6
+  and 8 times are estimates from the crate's step-by-step measurements).
+  rivet-av1 leads in luma and trails slightly once chroma counts, because
+  rav1e codes chroma with a much finer quantiser than luma. On all threads
+  it is several times faster than rav1e at speeds 6 and 8, since it searches
+  a one-tile frame's superblock rows in a wavefront and rav1e gains little
+  from threads on one tile. What made the difference was the encoder's own
+  work: alt-ref groups of 16 frames, rate-distortion optimised quantisation,
+  chroma weighting and trials, the inter tools (switchable filters, OBMC,
+  local warps) and each speed's search set to what rav1e spends at that
+  speed. The cost a caller sees is delay: frames are held a group at a time
+  ([codec-encode.md](codec-encode.md#software-av1--encodeav1_swrs)).
 - Verification is rivet's own throughout: the AV1, VP9 and image outputs are
   read back with rivet's demuxers and decoded with rivet's decoders
   (`crates/rivet/tests/new_codecs_e2e.rs`, the image tests;

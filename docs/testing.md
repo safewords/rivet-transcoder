@@ -198,10 +198,12 @@ None at the moment. Add rows as `| Test | Since | What happens |`.
 - **Throughput figures are release-build measurements, not tests.** They are
   `#[ignore]`d tests run by hand:
   `cargo test -p rivet-codec --release --features av1-sw-fallback --test software_av1_roundtrip -- --ignored --nocapture throughput_at_720p`
-  (software AV1 encode and decode at 1280x720; on the dev box 2.08 frames/s
-  encode, 1.9 megapixels/s, and 25 frames/s, 23 megapixels/s, to decode that
-  stream — the crate's quoted ~6 megapixels/s is for streams that use the
-  whole toolbox) and
+  (software AV1 encode and decode at 1280x720, 32 frames in two alt-ref
+  groups at the `standard` tier on one thread; with rivet-av1 `a328e71` on an
+  Apple M3 Max shared with other work, 5.2 frames/s encode, 4.8
+  megapixels/s, and about 420 frames/s to decode that stream, which is a
+  simple synthetic one — the crate's README has the decoder on camera
+  footage, 60 to 70 megapixels/s on one thread) and
   `cargo test -p rivet-transcoder --release --features image --lib -- --ignored --nocapture png_level_timings`
   (PNG DEFLATE levels on a 2048x2048 picture). Quote the figure with the
   machine and the stream.

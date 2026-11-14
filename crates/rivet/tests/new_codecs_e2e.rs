@@ -616,9 +616,15 @@ fn av1_in_software_8_and_10_bit() {
     // (This clip, a ramp and a square, takes about 250 kb/s at the finest
     // quantiser: a 300 kb/s rung, as this test once asked, cannot be
     // reached by any rate controller — it came in at 0.84x at quantiser 1.)
+    // Coded as the frames come (`bframes=0`): in alt-ref groups the first
+    // group is planned before the rate model has seen a coded frame and
+    // overspends (1.3x on this one second), which later groups repay — on
+    // longer runs (the encoder's unit test, 200 frames; 300 frames of
+    // foreman at 300 kb/s land at 0.99x), not inside one second.
     let bitrate = 120_000u32;
     let overrides = codec::encode::tuning::EncodeOverrides {
         bitrate: Some(bitrate),
+        bframes: Some(0),
         ..Default::default()
     };
     let rung = Rung::new(128, 96).with_quality(rivet::Quality::default().with_overrides(overrides));

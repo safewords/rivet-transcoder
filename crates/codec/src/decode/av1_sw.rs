@@ -422,13 +422,15 @@ mod tests {
     }
 
     /// Temporal units from rivet-av1's own encoder: `n` frames of a moving
-    /// gradient at `w` x `h`.
+    /// gradient at `w` x `h`, one unit per frame. The encoder holds the
+    /// frames of an alt-ref group until the group is complete (empty units
+    /// until then), and `flush` codes the last of them.
     fn stream(w: u32, h: u32, n: u32, bit_depth: u32) -> Vec<Vec<u8>> {
         let mut cfg = av1::Config::new(w, h);
         cfg.bit_depth = bit_depth;
         cfg.keyframe_interval = 4;
         let mut enc = av1::Encoder::new(cfg);
-        (0..n)
+        let mut units: Vec<Vec<u8>> = (0..n)
             .map(|i| {
                 let mut f = av1::Frame::new(w, h, bit_depth, av1::ChromaFormat::Yuv420);
                 for p in 0..3 {
@@ -442,7 +444,13 @@ mod tests {
                 }
                 enc.encode(&f).unwrap()
             })
-            .collect()
+            .filter(|u| !u.is_empty())
+            .collect();
+        while let Some(u) = enc.flush().unwrap() {
+            units.push(u);
+        }
+        assert_eq!(units.len(), n as usize);
+        units
     }
 
     fn decode_all(units: &[Vec<u8>]) -> Vec<VideoFrame> {

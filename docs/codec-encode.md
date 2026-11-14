@@ -264,13 +264,40 @@ is still accepted). Always compiled; `av1-sw-fallback` (alias
 and it says so at `warn` when it does.
 
 - **Writes.** Profile 0, 8- or 10-bit 4:2:0 (`yuv420p`, `yuv420p10le`), any
-  width (tile columns, coded in parallel); one temporal unit per frame, every
-  frame shown, in display order; key frames at the interval and on demand,
-  inter frames from the last two frames and a golden frame, compound
-  prediction, chroma from luma, palettes on screen content, and the in-loop
-  filters searched (loop filter levels, CDEF, loop restoration): a
-  rate-distortion-searching encoder, about half the bits of the first
-  version at the same PSNR (the crate's README has the measurements).
+  width (tile columns, coded in parallel); one temporal unit per frame, in
+  display order; key frames at the interval and on demand. Frames are coded
+  in alt-ref groups of 16 (below), each predicted from the nearest frames on
+  both sides, with compound prediction, skip mode and the references' motion
+  field; switchable interpolation filters, OBMC and local warped motion;
+  chroma from luma, palettes and intra block copy on screen content; and the
+  in-loop filters searched (loop filter levels, CDEF, loop restoration),
+  every decision made by rate-distortion trial coding and the coefficients
+  chosen by rate-distortion optimised quantisation. (The crate also codes
+  4:2:2, 4:4:4, 12-bit, monochrome, lossless and film grain; rivet's adapter
+  asks for none of them yet.)
+- **How well, against rav1e.** rivet-av1 at `a328e71` against rav1e 0.8.1
+  (run as a black box), on five standard clips (foreman, mobile and akiyo at
+  352x288, ducks_take_off and park_joy at 1280x720; 30 frames, quantisers 64
+  to 192, one thread, the same speed in both). BD-rate is the change in bits
+  at the same PSNR, PSNR-Y with PSNR-YUV in brackets; negative favours
+  rivet-av1:
+
+  | tier (speed) | BD-rate | one-thread time against rav1e |
+  |---|---|---|
+  | `archive` (4) | −2.5 % (+2.8 %) | 0.99x |
+  | `standard` (6) | −3.2 % (+2.1 %) | about 0.94x |
+  | `draft` (8) | −2.8 % (+2.5 %) | about 0.98x |
+
+  So at rav1e's time the encoder is at parity: ahead in luma, a little behind
+  once chroma counts, because rav1e codes chroma with a much finer quantiser
+  than luma. The `standard` and `draft` times are estimates from the crate's
+  step-by-step measurements, not a final interleaved run. On all threads
+  rivet-av1 is several times faster than rav1e at speeds 6 and 8, because its
+  wavefront search spreads a one-tile frame over the threads and rav1e gains
+  little from them on one tile. These are the crate's numbers, measured with
+  its own search range (±16); rivet's `archive` searches ±32 and its `draft`
+  ±8, so their times differ a little from the table. The crate's README has
+  the per-clip tables and what each tool was worth.
 - **Quality.** `base_q_idx` 1-255: a CRF on AV1's 0-63 scale times four, else
   four times libaom's `cq-level` for the quality target — the same table the
   hardware tiers are equalised against.
@@ -290,15 +317,41 @@ and it says so at `warn` when it does.
   name.
 - **Speed.** The tier is the encoder's effort (`av1::Config::speed`: `draft`
   8, `standard` 6, `archive` 4 — how much of its rate-distortion search runs
-  and which tools) and the motion search range (±8 / ±16 / ±32). At `draft`
-  and `standard` the encoder searches each frame's superblock rows in a
-  wavefront on its threads, in one tile column (a `tiles=` override still
-  names columns; the stream does not depend on the thread count); at
-  `archive` the frame is cut into tile columns instead — as many as the
-  threads, a power of two, each at least 256 pixels wide — coded in
-  parallel. At `standard` about 1.4 frames/s at 1280x720 on one thread and
-  4.6 on four (`throughput_at_720p`; 0.25 and 0.8 before the encoder's
-  SIMD, pruned search and wavefront). A fallback, not a production encoder.
+  and which tools; each tier is set to what rav1e spends at the same speed)
+  and the motion search range (±8 / ±16 / ±32). At every tier the encoder
+  searches each frame's superblock rows in a wavefront on its threads, in one
+  tile column, since tile columns cost compression (contexts reset, no
+  prediction across them) and the wavefront needs none; a `tiles=` override
+  still names columns, and the stream does not depend on the thread count.
+  (At rivet-av1 `03054ad` speed 4 searched one tile on one thread, so
+  `archive` cut the frame into as many tile columns as the threads; the
+  adapter still does that for any speed without the wavefront.) At `standard` about
+  5.2 frames/s at 1280x720 on one thread and 13.8 on four
+  (`throughput_at_720p`: 32 frames, two alt-ref groups, flush included, on
+  an Apple M3 Max shared with other work; 1.4 and 4.6 at rivet-av1
+  `03054ad`, measured then on 12 frames without groups, and 0.25 and 0.8
+  before the encoder's SIMD, pruned search and wavefront). A fallback, not a production encoder: the
+  GPU tiers are still far faster.
+- **Delay: alt-ref groups.** The encoder codes 16 frames at a time in a
+  pyramid (`av1::Config::altref`): the last frame of the group first, hidden,
+  then the frame half way to it, and so on down, each hidden frame shown
+  later by a `show_existing_frame` in the temporal unit of its turn. It holds
+  a group's frames until the last one is sent, so `send_frame` returns no
+  packet for up to 16 frames, and the call that completes a group does the
+  whole group's work. The packets still come out one per frame sent and in
+  display order, so the adapter hands them the timestamps of the frames in
+  the order they were sent, and `flush` codes the frames of the last,
+  unfinished group: every caller (the single-file path, the chunked path,
+  the CMAF segment workers, live) already flushes and drains at the end of a
+  stream, and the chunked path's one-packet-per-frame check holds. A group
+  never spans a key frame — it ends before the interval's next key and
+  before a forced one — so every key frame still opens a stream that stands
+  alone, and segments and chunks still end exactly where they did. A rung
+  with `bframes=0` is coded without groups (`altref = 0`): a packet per frame
+  as it is sent, every frame predicted from those before it, for about 16 %
+  more bits. Live jobs set that on every AV1 rung that does not name
+  `bframes` (`job::live`), because a live segment should not wait 16 frames
+  and a 16-frame burst would back up the capture queue.
 - **Colour.** The job's colour description (primaries, transfer, matrix,
   range) goes into the sequence header, and its HDR10 mastering display and
   content light level into metadata OBUs on every key frame: the tier's caps
@@ -306,9 +359,10 @@ and it says so at `warn` when it does.
   build. A colour description with the identity matrix (RGB) is refused by
   name: AV1 allows it only at 4:4:4.
 - **Sessions.** `force_keyframe_next` is the encoder's own `force_keyframe`:
-  the next frame is a key frame with its sequence header, and nothing else is
-  reset (the rate controller carries on). `reset` is supported, so the
-  session pool reuses the encoder across chunks.
+  the next frame sent is a key frame with its sequence header (the group
+  before it ends on the frame before), and nothing else is reset (the rate
+  controller carries on). `reset` is supported, so the session pool reuses
+  the encoder across chunks; it drops any frames a group was holding.
 
 ## The other output codecs: VP9, VP8, MPEG-2, MPEG-4 Part 2, ProRes
 

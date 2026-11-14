@@ -170,16 +170,18 @@ no usable encode/decode silicon, without making the build environment part of
 the deployment story.
 
 - **Decode** (`decode/av1_sw.rs`, always in the chain behind NVDEC / AMF / QSV,
-  no feature): the whole specification, bit-exact on all 244 AOM test vectors
-  and all 3,015 Argon conformance streams; 8/10/12-bit 4:2:0 / 4:2:2 / 4:4:4
-  out, monochrome as 4:2:0 with neutral chroma, film grain applied. It runs on
-  its own worker thread three temporal units ahead of the caller
+  no feature): the whole specification, bit-exact on all 244 AOM test vectors,
+  all 3,015 Argon conformance streams and their 571 large-scale-tile streams;
+  8/10/12-bit 4:2:0 / 4:2:2 / 4:4:4 out, monochrome as 4:2:0 with neutral
+  chroma, film grain applied. Tiles and post-filters on up to four threads,
+  and on its own worker thread three temporal units ahead of the caller
   (`RIVET_AV1_DECODE_THREAD=0` decodes on the caller's thread).
 - **Encode** (`encode/av1_sw.rs`, backend `av1`; reached by name or through
-  `av1-sw-fallback`): profile 0, 8- and 10-bit 4:2:0, one tile (up to 4096
-  wide), key and inter frames, a quality target (quantiser = 4 × the libaom
-  cq-level) or an average bitrate (the crate's rate control); session `reset`
-  supported.
+  `av1-sw-fallback`): profile 0, 8- and 10-bit 4:2:0, any width, alt-ref
+  groups of 16 frames (none on a `bframes=0` rung, and none live), a quality
+  target (quantiser = 4 × the libaom cq-level) or an average bitrate (the
+  crate's rate control), the colour description and HDR10 metadata in the
+  bitstream; forced key frames and session `reset` supported.
 
 No hardware verification is owed (there is no hardware), but the round-trip is
 covered by `crates/codec/tests/software_av1_roundtrip.rs`, which encodes and
@@ -189,24 +191,39 @@ and a spot-check misses it — and end to end by
 `crates/rivet/tests/new_codecs_e2e.rs` (`av1_in_software_8_and_10_bit`).
 
 Open:
-- [ ] **Decode speed.** Single-threaded scalar, about 6 megapixels/s on one
-      core on streams that use the whole toolbox (~7 fps at 720p, ~3 fps at
-      1080p); rivet's own encoder's output decodes at about 23 MP/s (25 fps
-      at 720p). Measure with `cargo test -p rivet-codec --release --features
-      av1-sw-fallback --test software_av1_roundtrip -- --ignored --nocapture
-      throughput_at_720p`. The worker thread only
-      overlaps the decode with conversion, scaling and encoding; the crate's
-      API has no tile or frame parallelism to use beyond that. Tile threading
-      and SIMD belong in `crates/av1`.
-- [ ] **Encode speed and quality.** About 10 fps at 352x288 and 2 fps
-      (1.9 MP/s) at 1280x720 single-threaded,
-      and below rav1e's quality at the same quantiser. One tile, so nothing to
-      spread over cores either.
-- [ ] **HDR AV1 in software.** The encoder writes no colour description into
-      the sequence header (the MP4 `colr` box carries the colour), so its
-      output capability is 10-bit SDR; HDR10 / HLG AV1 still needs a GPU.
-- [ ] **A forced-keyframe call in the crate.** `force_keyframe_next` starts a
-      fresh encoder today, as the crate has none.
+- [x] **Decode speed.** It was single-threaded scalar, about 6 megapixels/s on
+      one core on full-toolbox streams. rivet-av1 now decodes tiles and runs
+      its post-filters on several threads, reconstructs a one-tile frame's
+      superblock rows behind its parsing, and has AVX2 / NEON in its hottest
+      kernels: about 60-70 megapixels/s on one thread on its own encoder's
+      720p and 1080p output, 75-115 on four (the crate's README). Measure
+      with `cargo test -p rivet-codec --release --features av1-sw-fallback
+      --test software_av1_roundtrip -- --ignored --nocapture
+      throughput_at_720p`. Left: the adapter does not yet use
+      `Decoder::set_frames_in_flight`, which a one-tile stream needs to use
+      more than two or three threads.
+- [x] **Encode speed and quality** (rivet-av1 `a328e71`, 2026-11-14). It was
+      about 10 fps at 352x288 and 2 fps at 1280x720 on one thread, one tile,
+      and below rav1e's quality at the same quantiser. Now each tier spends
+      what rav1e spends at its speed and codes fewer bits than rav1e at the
+      same PSNR-Y: against rav1e 0.8.1 on five standard clips (30 frames, one
+      thread), BD-rate PSNR-Y (PSNR-YUV) −2.5 % (+2.8 %) at speed 4 for
+      0.99x rav1e's time, −3.2 % (+2.1 %) at speed 6 for about 0.94x, −2.8 %
+      (+2.5 %) at speed 8 for about 0.98x; on all threads it is several times
+      faster than rav1e at speeds 6 and 8. Left: PSNR-YUV, 2 % to 3 % behind,
+      which is in how chroma is searched and quantised (the crate's README,
+      "Not there yet").
+- [x] **HDR AV1 in software.** The encoder writes the colour description into
+      the sequence header and HDR10 mastering display and content light
+      level into metadata OBUs on every key frame, so HDR10 / HLG AV1 works on
+      a CPU-only build.
+- [x] **A forced-keyframe call in the crate.** `force_keyframe_next` is the
+      encoder's own `force_keyframe`; nothing else is reset.
+- [ ] **Alt-ref groups that follow the content.** A group is 16 frames
+      whatever they hold; a scene cut inside one is coded as if it were not
+      there. The crate measured ending groups at cuts at +1 % to +5 % and left
+      it out; a group sized to the chunk or segment it ends in is rivet's
+      side of the same question.
 
 Software decode of ProRes, VP8, VP9, MPEG-1 / MPEG-2 and MPEG-4 Part 2 is
 covered by the workspace's own decoders since 2026-10-02 — see [Software ProRes,

@@ -858,8 +858,15 @@ encoder is rivet's MPEG-4 Part 2 encoder (see [codec-encode.md](codec-encode.md)
 workspace's own AV1 decoder, [`crates/av1`](../crates/av1/README.md) (a git
 submodule, the rivet-av1 repository), written clean-room from the AV1
 Bitstream & Decoding Process Specification. It implements the whole
-specification and is bit-exact on all 244 AOM test vectors and all 3,015
-Argon conformance streams. It is always compiled and always in the chain,
+specification and is bit-exact on all 244 AOM test vectors, all 3,015
+Argon conformance streams and all 571 of their large-scale-tile streams
+(rivet does not use large-scale tile decoding; it is the crate's). Until
+rivet-av1 `5929ecc` (taken 2026-11-14) it was bit-exact on x86-64 only
+above 8 bits: on aarch64 (NEON) and wasm a 10- or 12-bit masked compound
+prediction was cut to 16 bits, and 70 of the Argon streams decoded wrong
+there. That matters to rivet on ARM hosts and to wasm-av1, which builds the
+same crate; CI runs on x86-64, which takes the general path, so it never
+saw it. It is always compiled and always in the chain,
 behind NVDEC, AMF and QSV, like the other native decoders: there is no
 feature to turn it on (`rav1d-fallback`, the switch for rav1d, which it
 replaced on 2026-10-03, is kept as a no-op). It decodes every layout and
@@ -876,7 +883,9 @@ hottest kernels — the inverse transforms, the inter prediction filters, the
 loop filter and CDEF — each bit-exact with its scalar version: on the
 encoder's own 720p / 1080p output about 60-70 megapixels a second on one
 thread and 75-115 with four (the crate's README has the figures; before,
-single-threaded scalar, about 26). The adapter gives each decoder
+single-threaded scalar, about 26). The post-filters' copies now reuse the
+planes of frames no longer referenced instead of allocating new ones, which
+the crate measured as neither faster nor slower. The adapter gives each decoder
 `decode_threads()` threads — `RIVET_AV1_DECODE_THREADS`, else up to four —
 and also takes the decode off the caller's thread: each decoder runs on a
 worker thread of its own, up to three temporal units ahead of the caller

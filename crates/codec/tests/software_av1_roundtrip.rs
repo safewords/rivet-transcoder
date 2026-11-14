@@ -220,7 +220,9 @@ fn the_encoder_refuses_a_frame_of_the_wrong_size() {
 #[test]
 #[ignore = "a measurement: run with --release --ignored --nocapture"]
 fn throughput_at_720p() {
-    let (w, h, n) = (1280u32, 720u32, 12u64);
+    // Two alt-ref groups of 16 frames, so the measurement is of the
+    // encoder as it codes a stream, not of one partial group.
+    let (w, h, n) = (1280u32, 720u32, 32u64);
     let frames: Vec<VideoFrame> = (0..n)
         .map(|t| {
             let (wu, hu) = (w as usize, h as usize);
@@ -263,6 +265,12 @@ fn throughput_at_720p() {
             packets.push(p);
         }
     }
+    // The last group's frames are coded at the flush.
+    enc.flush().unwrap();
+    while let Some(p) = enc.receive_packet().unwrap() {
+        packets.push(p);
+    }
+    assert_eq!(packets.len() as u64, n);
     let encode = start.elapsed().as_secs_f64();
     let mp = f64::from(w * h) * n as f64 / 1e6;
     eprintln!(

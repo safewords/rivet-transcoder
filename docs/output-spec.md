@@ -247,7 +247,11 @@ compounding per-rung step. An empty policy — the default — changes nothing.
 `bframes=N` is a non-pyramid run of N B pictures between anchors on NVENC and
 the software H.264/H.265 tier (QSV maps it to `GopRefDist` but has not been
 verified with it); the muxers carry the reorder as `ctts` / `trun` composition
-offsets, so single-file, chunked and HLS output all take it.
+offsets, so single-file, chunked and HLS output all take it. The software AV1
+encoder codes in alt-ref groups of 16 frames (its own B-frame pyramid, with
+hidden frames shown later, so no reorder reaches the container) unless the
+rung says `bframes=0`, which codes each frame as it comes for about 16 % more
+bits; live jobs set that on AV1 rungs that do not name `bframes`.
 [`LadderPolicy`](../crates/codec/src/encode/tuning/policy_grammar.rs) is the
 recommendation as numbers, for tuning one of them.
 
@@ -259,7 +263,8 @@ recommendation as numbers, for tuning one of them.
   default; an `encode-policy` `speed=` word wins for its rungs); the old
   `speed=` / `preset=` keys are refused, naming `video-speed`. Each encoder
   maps it onto its own presets: NVENC P5 / P6 / P7; the software AV1 encoder
-  its motion search range (±8 / ±16 / ±32); VP9 the crate's speed and
+  its effort (speed 8 / 6 / 4, each matched to rav1e's time at that speed)
+  and motion search range (±8 / ±16 / ±32); VP9 the crate's speed and
   partitioning (`draft` fixed 32x32 partitions; `standard` fixed 16x16, about
   10 frames/s at 352x288 on one core; `archive` a rate-distortion partition
   search, about 1.7 frames/s).

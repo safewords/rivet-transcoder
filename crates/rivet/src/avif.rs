@@ -50,18 +50,36 @@ const MAX_ITEM_WIDTH: u32 = 4096;
 /// The `auxC` URN that makes an auxiliary item an alpha plane.
 const ALPHA_URN: &str = "urn:mpeg:mpegB:cicp:systems:auxiliary:alpha";
 
-/// The encoder's `base_q_idx` for a 1-100 quality: 100 is near-lossless
-/// (`base_q_idx` 1), 1 the coarsest (255); piecewise linear between anchors
-/// chosen so the scale reads like the other lossy formats' (60, the AVIF
-/// default, lands at 120: some 40 dB on photographic content).
+/// The encoder's quantiser (`av1::Config::quantizer`) for a 1-100
+/// quality: 100 is near-lossless (1), 1 the coarsest (255); piecewise
+/// linear between anchors chosen so the scale reads like the other lossy
+/// formats' (60, the AVIF default, codes its key frame at `base_q_idx`
+/// 120: some 40 dB on photographic content).
+///
+/// The encoder codes a key frame finer than the quantiser it is given —
+/// since rivet-av1 `a9bdae0`, a quantiser step 1.2 octaves finer (with its
+/// default alt-ref groups; `KEY_Q` in its `encoder` module), as rav1e does
+/// for video, where every later frame predicts from the key frame. An AVIF
+/// item is one key frame, so these anchors are the `base_q_idx` values the
+/// scale was set by (1→255, 20→205, 40→162, 60→120, 80→72, 90→44,
+/// 95→22, 98→10, 100→1) put through the inverse of that offset with the
+/// specification's 8-bit `Ac_Qlookup`: each coded within a table step of
+/// the value it stood for. Taken unadjusted, quality 60 came out at about
+/// 1.9x the bytes and 4.5 to 5.5 dB more PSNR than before. The coarsest
+/// key frame the encoder codes is now `base_q_idx` 212, so qualities below
+/// about 15 bottom out there. If rivet-av1 changes `KEY_Q`, these must be
+/// worked out again; the crate does not expose the offset or the coded
+/// `base_q_idx`, so no test here can see it move.
 pub fn quantizer_for_quality(quality: u8) -> u32 {
-    const ANCHORS: [(f32, f32); 7] = [
+    const ANCHORS: [(f32, f32); 9] = [
         (1.0, 255.0),
-        (20.0, 205.0),
-        (40.0, 162.0),
-        (60.0, 120.0),
-        (80.0, 72.0),
-        (90.0, 44.0),
+        (20.0, 248.0),
+        (40.0, 207.0),
+        (60.0, 167.0),
+        (80.0, 130.0),
+        (90.0, 103.0),
+        (95.0, 59.0),
+        (98.0, 31.0),
         (100.0, 1.0),
     ];
     let q = f32::from(quality.clamp(1, 100));
@@ -719,7 +737,7 @@ mod tests {
     fn quality_maps_monotonically_onto_the_quantiser() {
         let qs: Vec<u32> = (1..=100).map(quantizer_for_quality).collect();
         assert!(qs.windows(2).all(|w| w[1] <= w[0]), "{qs:?}");
-        assert_eq!((qs[0], qs[59], qs[99]), (255, 120, 1));
+        assert_eq!((qs[0], qs[59], qs[99]), (255, 167, 1));
     }
 
     #[test]

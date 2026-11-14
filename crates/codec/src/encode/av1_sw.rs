@@ -21,13 +21,39 @@
 //! # What it takes and writes
 //!
 //! Profile 0: 8- or 10-bit 4:2:0 (`Yuv420p`, `Yuv420p10le`), one temporal
-//! unit per frame, every frame shown and in display order — so each packet
-//! carries its own frame's timestamp. Any width (frames wider than 4096 are
-//! coded in several tile columns). Key frames at the interval, and wherever
+//! unit per frame, in display order — so each packet carries its own
+//! frame's timestamp. Any width (frames wider than 4096 are coded in several
+//! tile columns). Key frames at the interval, and wherever
 //! `force_keyframe_next` asks (the encoder's own `force_keyframe`: the next
-//! frame is a key frame with its sequence header, nothing else is reset);
-//! inter frames predict from the last two frames and a golden frame, and may
-//! average two of them.
+//! frame is a key frame with its sequence header, nothing else is reset).
+//!
+//! # Alt-ref groups, and the delay they bring
+//!
+//! At every tier (speeds 4 to 8, where the encoder's rate-distortion search
+//! runs) frames are coded in groups of 16 (`av1::Config::altref`): the last
+//! frame of a group first, hidden, then the frame half way to it, and so on
+//! down, each predicted from frames on both sides; each hidden frame is shown
+//! later by a `show_existing_frame` in the temporal unit of its turn. That
+//! was the largest single step that brought the encoder level with rav1e
+//! (about −16 % BD-rate on its own), and it costs a delay: the
+//! encoder holds a group's frames until its last one comes, so `send_frame`
+//! yields no packet for up to 16 frames, and then one call does the whole
+//! group's work while the packets come out one per frame in display order.
+//! The temporal units still map one to one onto the frames sent, which is
+//! why the packets carry the timestamps of the frames in the order they were
+//! sent (`pending_pts`), and why `flush` must drain the encoder: it codes the
+//! frames of the last, unfinished group. A group never spans a key frame (it
+//! ends before the next interval key and before a forced one), so every
+//! key frame still opens a stream that stands alone: the chunked path's
+//! stitch, the CMAF worker's segments and the live HLS segments all rely on
+//! that.
+//!
+//! A rung that asks for no B-frames (`overrides.bframes = Some(0)`) is coded
+//! without groups (`altref = 0`): frame in, packet out, every frame predicted
+//! from the frames before it, for about 16 % more bits. Live jobs ask for
+//! that on every AV1 rung (`job::live`), since a live picture should leave
+//! as soon as it is coded and a 16-frame burst would back up the capture
+//! queue.
 //!
 //! The colour description goes into the sequence header (`color_config()`:
 //! primaries, transfer, matrix, range, from the job's `color_metadata`), and
@@ -53,15 +79,16 @@
 //! # Speed
 //!
 //! A rate-distortion-searching encoder in Rust, SIMD in its hot kernels
-//! (its own as well as the decoder's). At the Standard and Draft tiers it
-//! searches each frame's superblock rows in a wavefront on the encoder's
-//! threads (one tile column unless `tiles=` asks; the stream does not depend
-//! on the thread count); at the Archive tier the frame is cut into tile
-//! columns instead (as many as the threads, a power of two, each at least
-//! 256 pixels wide) that are coded in parallel. At the Standard tier about
-//! 1.4 frames/s at 1280x720 on one thread and 4.6 on four
-//! (`throughput_at_720p`; it was 0.25 and 0.8). A fallback, not a production encoder;
-//! the GPU tiers come first.
+//! (its own as well as the decoder's), each speed set to what rav1e spends
+//! at the same speed: at rav1e 0.8.1's one-thread time it codes 2.5 % to
+//! 3.2 % fewer bits at the same PSNR-Y (2.1 % to 2.8 % more at the same
+//! PSNR-YUV). At every tier it searches each frame's superblock rows in a
+//! wavefront on the encoder's threads (one tile column unless `tiles=` asks;
+//! the stream does not depend on the thread count). At the Standard tier
+//! about 5.2 frames/s at 1280x720 on one thread and 13.8
+//! on four (`throughput_at_720p`; it was 0.25 and 0.8 before the SIMD and
+//! the wavefront). A fallback, not a production encoder; the GPU tiers come
+//! first.
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -76,6 +103,10 @@ pub struct Av1Encoder {
     inner: av1::Encoder,
     cfg: av1::Config,
     ready: std::collections::VecDeque<EncodedPacket>,
+    /// The timestamps of the frames sent whose temporal units the encoder
+    /// has not returned yet (an alt-ref group's), oldest first: the units
+    /// come out in display order, one per frame sent.
+    pending_pts: std::collections::VecDeque<u64>,
 }
 
 /// The H.273 colour description of the job, as the encoder writes it.
@@ -192,6 +223,14 @@ impl Av1Encoder {
         cfg.search_range = p.search_range;
         cfg.speed = p.speed;
         cfg.tools = av1::Tools::for_speed(p.speed);
+        // Alt-ref groups (see the module docs) unless the rung asks for no
+        // B-frames: those are what a caller that needs frame in, packet out
+        // (a live job) sets, and an alt-ref group is AV1's B-frame pyramid.
+        cfg.altref = if config.overrides.bframes == Some(0) {
+            0
+        } else {
+            av1::encoder::DEFAULT_ALTREF
+        };
         cfg.threads = threads;
         cfg.tile_cols_log2 =
             tile_cols_log2(config.width, threads, p.tile_columns, cfg.tools.wavefront);
@@ -212,6 +251,7 @@ impl Av1Encoder {
             quantizer,
             bit_depth,
             speed = cfg.speed,
+            altref = cfg.altref,
             tiles = 1u32 << cfg.tile_cols_log2,
             threads,
             bitrate = ?rate,
@@ -222,7 +262,26 @@ impl Av1Encoder {
             inner: av1::Encoder::new(cfg.clone()),
             cfg,
             ready: Default::default(),
+            pending_pts: Default::default(),
         })
+    }
+
+    /// Queues a temporal unit the encoder returned, as the packet of the
+    /// oldest frame still waiting for one (none while it holds a group).
+    fn take(&mut self, data: Vec<u8>) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let pts = self
+            .pending_pts
+            .pop_front()
+            .context("the software AV1 encoder returned more temporal units than frames sent")?;
+        self.ready.push_back(EncodedPacket {
+            data: Bytes::from(data),
+            pts,
+            is_keyframe: self.inner.last_was_keyframe(),
+        });
+        Ok(())
     }
 
     /// The settings the encoder was built with.
@@ -252,20 +311,35 @@ impl Encoder for Av1Encoder {
             av1::ChromaFormat::Yuv420,
         );
         picture.data.copy_from_slice(&frame.data[..want]);
-        let data = self
-            .inner
-            .encode(&picture)
-            .context("the software AV1 encoder refused a frame")?;
-        let is_keyframe = self.inner.last_was_keyframe();
-        self.ready.push_back(EncodedPacket {
-            data: Bytes::from(data),
-            pts: frame.pts,
-            is_keyframe,
-        });
-        Ok(())
+        self.pending_pts.push_back(frame.pts);
+        let data = match self.inner.encode(&picture) {
+            Ok(data) => data,
+            Err(e) => {
+                // Refused, so not held: no unit will come for it.
+                self.pending_pts.pop_back();
+                return Err(e).context("the software AV1 encoder refused a frame");
+            }
+        };
+        self.take(data)
     }
 
+    /// Codes the frames of the last, unfinished alt-ref group; their
+    /// packets come out of `receive_packet`. The encoder can take more
+    /// frames afterwards.
     fn flush(&mut self) -> Result<()> {
+        while let Some(data) = self
+            .inner
+            .flush()
+            .context("the software AV1 encoder failed flushing its last frames")?
+        {
+            self.take(data)?;
+        }
+        if !self.pending_pts.is_empty() {
+            bail!(
+                "the software AV1 encoder flushed with {} frames sent and never coded",
+                self.pending_pts.len()
+            );
+        }
         Ok(())
     }
 
@@ -284,6 +358,7 @@ impl Encoder for Av1Encoder {
     fn reset(&mut self) -> Result<()> {
         self.inner = av1::Encoder::new(self.cfg.clone());
         self.ready.clear();
+        self.pending_pts.clear();
         Ok(())
     }
 }
@@ -312,13 +387,18 @@ mod tests {
         10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10()
     }
 
-    /// Every packet decodes with rivet's own decoder to the encoder's own
-    /// reconstruction, near the source; key frames where the interval and a
-    /// forced key put them, timestamps unchanged.
+    /// Without alt-ref groups (a rung that asks for no B-frames, as a live
+    /// one does): a packet per frame as it is sent, which decodes with
+    /// rivet's own decoder to the encoder's own reconstruction, near the
+    /// source; key frames where the interval and a forced key put them,
+    /// timestamps unchanged.
     #[test]
-    fn packets_decode_near_the_source() {
+    fn without_groups_each_frame_is_a_packet_at_once() {
         let (w, h) = (64, 48);
-        let mut enc = Av1Encoder::new(config(w, h)).unwrap();
+        let mut cfg = config(w, h);
+        cfg.overrides.bframes = Some(0);
+        let mut enc = Av1Encoder::new(cfg).unwrap();
+        assert_eq!(enc.config().altref, 0);
         let mut dec = av1::Decoder::new();
         let mut keys = Vec::new();
         for n in 0..5u64 {
@@ -340,7 +420,87 @@ mod tests {
             let db = psnr(&shown.data[..luma], &src.data[..luma]);
             assert!(db > 30.0, "frame {n}: {db:.1} dB");
         }
+        enc.flush().unwrap();
+        assert!(enc.receive_packet().unwrap().is_none());
         assert_eq!(keys, [true, false, false, true, true]);
+    }
+
+    /// With alt-ref groups (the default): the encoder holds a group's
+    /// frames, and `flush` codes the last of them. One packet per frame
+    /// sent all the same, in display order with the frames' timestamps, each
+    /// decoding to a frame near its source; key frames where the interval
+    /// and a forced key put them, so a group never spans one.
+    #[test]
+    fn groups_hold_frames_and_flush_codes_the_rest() {
+        let (w, h) = (64, 48);
+        let mut cfg = config(w, h);
+        cfg.keyframe_interval = 24;
+        let mut enc = Av1Encoder::new(cfg).unwrap();
+        assert_eq!(enc.config().altref, av1::encoder::DEFAULT_ALTREF);
+        let frames = 40u64;
+        let sources: Vec<_> = (0..frames)
+            .map(|n| super::super::native::test_picture(w, h, n))
+            .collect();
+        let mut packets = Vec::new();
+        let mut held = false;
+        for (n, src) in sources.iter().enumerate() {
+            if n == 30 {
+                enc.force_keyframe_next().unwrap();
+            }
+            enc.send_frame(src).unwrap();
+            let before = packets.len();
+            while let Some(p) = enc.receive_packet().unwrap() {
+                packets.push(p);
+            }
+            held |= packets.len() == before;
+        }
+        assert!(held, "the encoder held a group's frames");
+        assert!((packets.len() as u64) < frames);
+        enc.flush().unwrap();
+        while let Some(p) = enc.receive_packet().unwrap() {
+            packets.push(p);
+        }
+        assert_eq!(packets.len() as u64, frames, "a packet per frame sent");
+        let mut dec = av1::Decoder::new();
+        let luma = (w * h) as usize;
+        for (n, p) in packets.iter().enumerate() {
+            assert_eq!(p.pts, n as u64, "display order");
+            assert_eq!(p.is_keyframe, [0, 24, 30].contains(&n), "frame {n}");
+            let shown = dec.decode(&p.data).unwrap().expect("a shown frame");
+            let db = psnr(&shown.data[..luma], &sources[n].data[..luma]);
+            assert!(db > 30.0, "frame {n}: {db:.1} dB");
+        }
+        // The forced key frame opens a stream of its own: the packets from
+        // it decode with a fresh decoder.
+        let mut fresh = av1::Decoder::new();
+        for p in &packets[30..] {
+            assert!(fresh.decode(&p.data).unwrap().is_some());
+        }
+    }
+
+    /// `reset` drops the frames a group held: the next stream starts
+    /// clean, its first packet a key frame with the first frame's timestamp.
+    #[test]
+    fn reset_drops_a_held_group() {
+        let (w, h) = (64, 48);
+        let mut enc = Av1Encoder::new(EncoderConfig {
+            keyframe_interval: 60,
+            ..config(w, h)
+        })
+        .unwrap();
+        for n in 0..5 {
+            enc.send_frame(&super::super::native::test_picture(w, h, n))
+                .unwrap();
+        }
+        enc.reset().unwrap();
+        assert!(enc.receive_packet().unwrap().is_none());
+        enc.send_frame(&super::super::native::test_picture(w, h, 100))
+            .unwrap();
+        let p = enc.receive_packet().unwrap().expect("a key frame at once");
+        assert!(p.is_keyframe);
+        assert_eq!(p.pts, 100);
+        enc.flush().unwrap();
+        assert!(enc.receive_packet().unwrap().is_none());
     }
 
     #[test]
@@ -477,7 +637,9 @@ mod tests {
         let mut dec = av1::Decoder::new();
         for _ in 0..2 {
             enc.send_frame(&frame).unwrap();
-            let p = enc.receive_packet().unwrap().unwrap();
+        }
+        enc.flush().unwrap();
+        while let Some(p) = enc.receive_packet().unwrap() {
             let back = dec.decode(&p.data).unwrap().unwrap();
             assert_eq!(back.color.color_primaries, 9);
             assert_eq!(back.color.transfer_characteristics, 16);
@@ -532,38 +694,51 @@ mod tests {
         )
     }
 
-    /// A bitrate rung lands near its rate, and a higher rate spends more.
+    /// A bitrate rung lands near its rate, and a higher rate spends more:
+    /// over 40 frames coded as they come (`bframes=0`), and over 200 in
+    /// alt-ref groups. Groups need the longer run: the first group is
+    /// planned before the rate model has seen a coded frame, and on these
+    /// small noisy frames it overspends (1.6x to 2.3x the rate over the
+    /// first 40 frames), which the groups after it repay (within 1 % over
+    /// 200 frames).
     #[test]
     fn a_bitrate_rung_is_coded_to_its_rate() {
         let (w, h) = (96, 64);
-        let achieved = |bitrate: u32| {
+        let achieved = |bitrate: u32, bframes: Option<u8>, n: u64| {
             let overrides = EncodeOverrides {
                 bitrate: Some(bitrate),
+                bframes,
                 ..Default::default()
             };
             let cfg = EncoderConfig {
                 overrides,
                 frame_rate: 25.0,
-                keyframe_interval: 50,
+                keyframe_interval: 250,
                 ..config(w, h)
             };
             let mut enc = Av1Encoder::new(cfg).unwrap();
-            let mut bits = 0u64;
-            let n = 40;
             for i in 0..n {
                 enc.send_frame(&noisy(w, h, i)).unwrap();
-                bits += enc.receive_packet().unwrap().unwrap().data.len() as u64 * 8;
             }
+            enc.flush().unwrap();
+            let (mut bits, mut packets) = (0u64, 0u64);
+            while let Some(p) = enc.receive_packet().unwrap() {
+                bits += p.data.len() as u64 * 8;
+                packets += 1;
+            }
+            assert_eq!(packets, n);
             bits as f64 * 25.0 / n as f64
         };
-        let (low, high) = (achieved(150_000), achieved(400_000));
-        for (asked, got) in [(150_000.0, low), (400_000.0, high)] {
-            let ratio = got / asked;
-            assert!(
-                (0.6..1.6).contains(&ratio),
-                "asked {asked} b/s, got {got:.0} ({ratio:.2}x)"
-            );
+        for (bframes, n, close) in [(Some(0), 40, 0.6..1.6), (None, 200, 0.85..1.15)] {
+            let (low, high) = (achieved(150_000, bframes, n), achieved(400_000, bframes, n));
+            for (asked, got) in [(150_000.0, low), (400_000.0, high)] {
+                let ratio = got / asked;
+                assert!(
+                    close.contains(&ratio),
+                    "bframes {bframes:?}, {n} frames: asked {asked} b/s, got {got:.0} ({ratio:.2}x)"
+                );
+            }
+            assert!(high > low * 1.5, "{low:.0} vs {high:.0}");
         }
-        assert!(high > low * 1.5, "{low:.0} vs {high:.0}");
     }
 }
