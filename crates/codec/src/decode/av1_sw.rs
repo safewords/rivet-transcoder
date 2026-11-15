@@ -160,9 +160,12 @@ impl Av1Decoder {
                         let decoded = decoder.decode_all(&sample);
                         let failed = decoded.is_err();
                         if result_tx.send(decoded).is_err() || failed {
-                            // The adapter is gone, or the stream is broken:
-                            // a corrupt temporal unit leaves the reference
-                            // state undefined, so nothing after it decodes.
+                            // The adapter is gone, or the stream is broken.
+                            // rivet-av1 would hold back the frames that
+                            // depend on the corrupt unit and resume at the
+                            // next key frame, but a transcode that silently
+                            // drops frames is worse than one that fails, so
+                            // the error ends the stream here.
                             return;
                         }
                     }
