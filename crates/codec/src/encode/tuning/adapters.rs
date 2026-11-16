@@ -464,13 +464,12 @@ pub fn native_sw_quantizer(
 /// target + speed tier.
 ///
 /// The quantiser is `h26x_qp_for_target`, so a job that moves between the
-/// QSV hardware path and this one keeps its QP. The tier chooses the coding
-/// tools that cost search time: the 8x8 transform is cheap and on from
-/// `Standard` up; sub-16x16 partitions multiply the motion search and buy
-/// little outside content whose macroblock halves move differently, so only
-/// `Archive` pays for them; SAO (H.265) is an in-loop filter that costs bits
-/// per CTB and only pays where there is quantisation noise to shape, which at
-/// these QPs there is — on from `Standard` up. The H.265 coding quadtree
+/// QSV hardware path and this one keeps its QP. The tier is the encoder's
+/// own preset (`Draft` veryfast, `Standard` medium, `Archive` slow — see
+/// [`H26xSwParams::tier`]), and the tools here are the ones each preset was
+/// measured with against x264 and x265: the 8x8 transform at every tier;
+/// sub-16x16 partitions from `Standard` up (veryfast searches 16x16 only);
+/// SAO (H.265) at every tier. The H.265 coding quadtree
 /// splits a CTB into coding units by rate and distortion: two levels from
 /// `Standard` up, one at `Draft`.
 pub fn h26x_sw_params(
@@ -482,9 +481,10 @@ pub fn h26x_sw_params(
     let is_h264 = codec == crate::frame::VideoCodec::H264;
     H26xSwParams {
         qp,
-        transform_8x8: is_h264 && tier != SpeedTier::Draft,
-        subparts: is_h264 && tier == SpeedTier::Archive,
-        sao: !is_h264 && tier != SpeedTier::Draft,
+        tier,
+        transform_8x8: is_h264,
+        subparts: is_h264 && tier != SpeedTier::Draft,
+        sao: !is_h264,
         // Adaptive quantisation is off at every target and tier unless an
         // override names it: see "Opt-in tools in the software tier" in
         // docs/codec-encode.md.

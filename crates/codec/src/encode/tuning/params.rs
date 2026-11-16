@@ -40,11 +40,15 @@ pub struct Av1SwParams {
 pub struct H26xSwParams {
     /// Constant quantiser, 0..=51, lower = higher quality.
     pub qp: u8,
+    /// The speed tier, resolved through any `speed_tier` override. `h26x_sw`
+    /// maps it onto the encoder's preset — `Draft` veryfast, `Standard`
+    /// medium, `Archive` slow — with that preset's B pyramid and references.
+    pub tier: super::SpeedTier,
     /// H.264 only: offer the 8x8 transform (High profile). Ignored by H.265.
     pub transform_8x8: bool,
-    /// H.264 only: offer inter partitions below 16x16. Costs search time and
-    /// buys little outside content where macroblock halves move differently,
-    /// so it is the slowest tier's tool. Ignored by H.265.
+    /// H.264 only: offer inter partitions below 16x16. Every tier but
+    /// `Draft`, as the encoder's medium and slow presets search them.
+    /// Ignored by H.265.
     pub subparts: bool,
     /// H.265 only: sample adaptive offset. Refused by H.264.
     pub sao: bool,

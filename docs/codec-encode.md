@@ -1244,6 +1244,50 @@ and single reps spanning ±20%.
   118-byte table where no weight is chosen.
 - `any:wp=off` turns it off for a caller who wants the old streams.
 
+### Speed tiers are the h26x crate's presets (2026-11-16)
+
+Each `SpeedTier` codes with the native encoder's own preset and the
+structure it was tuned at (`h26x_sw::preset_structure`, mirroring the crate's
+`h26xenc --preset`):
+
+| tier | preset | H.264 | H.265 |
+|---|---|---|---|
+| `draft` | veryfast | 8x8 transform, 16x16 partitions only, 1 P reference | 1 reference |
+| `standard` | medium | 8x8 transform, sub-16x16 partitions | 2 references |
+| `archive` | slow | 8x8 transform, sub-16x16 partitions, 5 P references | 4 references, symmetric prediction units |
+
+Every tier also codes three B pictures in a pyramid between anchors and SAO
+on H.265. On a constant-QP rung it uses the macroblock-tree lookahead too:
+H.264 15 / 40 / 50 pictures by tier, H.265 16. The crate measures these
+presets against x264 and x265 at the same preset in
+[`crates/h26x/README.md`](../crates/h26x/README.md). At f0787cb, H.264 reaches
+x264's BD-rate in 0.96x / 0.97x / 0.92x of its time; H.265 is 13 to 14 % below
+x265 at medium, in 0.9x its time. These numbers have not been re-measured
+through `rivet transcode`.
+
+Before this the tier coded every rung at the crate's medium decisions, with
+no B pictures, one reference and no lookahead, and differed by tier only in
+the 8x8 transform, sub-16x16 partitions and SAO. Every software H.264 / H.265
+stream changes with this, and so does its encode time.
+
+**Overrides:**
+- `bframes=N` replaces the pyramid with a flat run of N B pictures, the
+  grammar the hardware tiers read; `bframes=0` codes none.
+- On a constant-QP rung, `lookahead=N` is the tree's depth, and
+  `lookahead=0` turns it off. There is no rate controller for it to inform.
+- On a bitrate rung there is no tree, because the rate controllers were
+  calibrated without one. There, `lookahead=` is the H.265 rate
+  controller's, as before.
+
+**Live** jobs set `bframes=0` and `lookahead=0` on every H.264 / H.265 rung
+that does not name them (`job::live`), for the reason given for AV1 above:
+a pyramid and a 40-picture tree delay a live segment by that many frames.
+
+A forced keyframe lands on the frame it was asked for under any lookahead.
+The crate's `force_idr` names the next picture *pushed* (502b334), so the
+tier's own bookkeeping for the H.265 rate lookahead is gone. A forced
+keyframe within a lookahead of the end of a stream no longer fails.
+
 ### H.265 coding quadtree depth in the software tier (measured, per speed tier)
 
 The native H.265 encoder can split each coding tree block into smaller coding
@@ -1282,8 +1326,8 @@ the table's depth overridden per run (a measurement-only environment variable, n
 committed). Arms per cell: depth 0, 1, 2 and a second depth 0 as the control.
 The order rotates every rep. The tier is set with `--encode-policy
 any:speed=draft|standard`. `archive` codes the same H.265 stream as `standard`,
-md5-equal in 6 / 6 checks, because the tier moves only SAO (off at `draft`)
-for H.265. Clips as in the H.264 table above (`testsrc2`, `zoom`, `pan`). Every
+md5-equal in 6 / 6 checks, because the tier moved only SAO (then off at `draft`)
+for H.265 when this was measured, before the tiers became the crate's presets. Clips as in the H.264 table above (`testsrc2`, `zoom`, `pan`). Every
 output decoded by ffmpeg with no error output and all frames present, and every
 rep's md5 equal to the first. Size is video packet bytes, luma PSNR by frame
 index. Time is the whole `rivet transcode`, as the median of paired ratios over
@@ -1351,8 +1395,8 @@ same at every target; H.264 0.**
   here has chosen quality per byte over time, and a quarter fewer bytes at a
   better PSNR is more than any other tool in the table buys. At a 16x16-CTB size
   it costs and codes exactly what depth 1 does.
-- **`draft`: 1.** `draft` is the tier that pays least for search (SAO is off
-  there). Depth 2 costs 4.2x the CPU of depth 0 at 1080p, and 6.3x on `zoom`.
+- **`draft`: 1.** `draft` is the tier that pays least for search (SAO was off
+  there when this was measured). Depth 2 costs 4.2x the CPU of depth 0 at 1080p, and 6.3x on `zoom`.
   Depth 1 costs 2.2x and keeps two thirds of the byte saving (−17.3% of
   −25.6%) and half the PSNR. It is not 0: even at `draft`, depth 1 is smaller
   and better at the same QP in every cell measured at all three sizes.

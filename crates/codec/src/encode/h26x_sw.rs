@@ -89,13 +89,15 @@
 //!
 //! # Order
 //!
-//! B pictures are enabled from `overrides.bframes` (non-pyramid: a fixed run
-//! of B pictures between anchors, matching the NVENC/QSV plumbing). With
-//! them coding order is not display order, so a coded picture's timestamp is
+//! Each speed tier is the encoder's own preset, with the structure that
+//! preset was tuned with (see [`preset_structure`]): three B pictures in a
+//! pyramid between anchors, and on a constant-QP rung the macroblock-tree
+//! lookahead. `overrides.bframes` replaces that with a flat run of B
+//! pictures (no pyramid), matching the NVENC/QSV plumbing; `bframes=0`
+//! codes none. With B pictures coding order is not display order, so a coded picture's timestamp is
 //! not the one that just arrived — it is the timestamp of the picture at the
 //! access unit's stream-wide *display* index. The encoder reports that index
 //! (`Access::display`); the muxer carries the composition offsets it implies.
-//! Left at zero the tier is byte-identical to the no-B one it replaced.
 
 use std::collections::VecDeque;
 
@@ -323,9 +325,94 @@ pub struct H26xEncoder {
     pts: Vec<u64>,
     /// Packets coded but not yet collected.
     ready: VecDeque<EncodedPacket>,
-    /// The display index of the frame `force_keyframe_next` promised an IDR,
-    /// until the encoder is told. See `force_keyframe_next`.
-    force_at: Option<u64>,
+}
+
+/// What a speed tier codes with beyond the tuning table's tools: the
+/// encoder's preset and the GOP structure it was tuned with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PresetStructure {
+    pub preset: h26x::encode::Preset,
+    pub bframes: u32,
+    pub pyramid: bool,
+    pub max_refs: u32,
+    pub tree_lookahead: u32,
+    pub inter_parts: h26x::encode::InterParts,
+}
+
+/// The encoder preset for a speed tier — `Draft` veryfast, `Standard`
+/// medium, `Archive` slow — with the structure the crate's `h26xenc
+/// --preset` codes it with, which is what its parity against x264 and x265
+/// was measured at (crates/h26x/README.md).
+///
+/// - Three B pictures in a pyramid between anchors, unless the rung names
+///   `bframes`: then a flat run of that many, the grammar the hardware
+///   tiers read from the same override, and `bframes=0` codes none.
+/// - References: H.264 slow searches five in P pictures; elsewhere the
+///   encoder raises the floor itself (two anchors for a B picture, four
+///   under a pyramid), so 1 is the honest floor to declare — over-declaring
+///   only enlarges the DPB the SPS asks a decoder to allocate. H.265 takes
+///   its preset's own count, and slow its symmetric partitions — what
+///   `h265_tune::apply_preset` sets, written out so the table here names
+///   every field rather than following the crate's function silently.
+/// - The macroblock-tree lookahead (H.264 15 / 40 / 50 pictures by tier,
+///   H.265 16) on a constant-QP rung only (H.265 uses it for the intra
+///   pictures' quantiser offset alone), or as deep as the rung's
+///   `lookahead=` names, 0 for none — a constant-QP rung has no rate
+///   controller for that knob to inform. The rate controllers were
+///   calibrated without the tree, so a bitrate rung codes without it (its
+///   `lookahead=` is the H.265 rate controller's). The tree adds that
+///   many pictures of output delay, which live jobs turn off
+///   (`job::live`).
+pub(crate) fn preset_structure(
+    codec: VideoCodec,
+    tier: crate::encode::tuning::SpeedTier,
+    bframes_override: Option<u8>,
+    constant_qp: bool,
+    lookahead_override: Option<u32>,
+) -> PresetStructure {
+    use crate::encode::tuning::SpeedTier;
+    use h26x::encode::Preset;
+    let preset = match tier {
+        SpeedTier::Draft => Preset::Veryfast,
+        SpeedTier::Standard => Preset::Medium,
+        SpeedTier::Archive => Preset::Slow,
+    };
+    let (bframes, pyramid) = match bframes_override {
+        Some(n) => (u32::from(n), false),
+        None => (3, true),
+    };
+    let h265 = codec == VideoCodec::H265;
+    let max_refs = match (h265, preset) {
+        (true, Preset::Veryfast) => 1,
+        (true, Preset::Medium) => 2,
+        (true, Preset::Slow) => 4,
+        (false, Preset::Slow) => 5,
+        (false, _) => 1,
+    };
+    let tree = match (h265, preset) {
+        (true, _) => 16,
+        (false, Preset::Veryfast) => 15,
+        (false, Preset::Medium) => 40,
+        (false, Preset::Slow) => 50,
+    };
+    PresetStructure {
+        preset,
+        bframes,
+        pyramid,
+        max_refs,
+        tree_lookahead: if constant_qp {
+            lookahead_override.unwrap_or(tree)
+        } else {
+            0
+        },
+        // H.265 slow's symmetric partitions; one prediction unit per coding
+        // unit everywhere else, which H.264 does not read.
+        inter_parts: if h265 && preset == Preset::Slow {
+            h26x::encode::InterParts::Symmetric
+        } else {
+            h26x::encode::InterParts::None
+        },
+    }
 }
 
 impl H26xEncoder {
@@ -384,21 +471,12 @@ impl H26xEncoder {
         let fps = (config.frame_rate.round() as u32).max(1);
 
         // Constant QP unless the rung names a rate. A request this tier
-        // cannot honour is said, not dropped: a lookahead informs a rate
-        // controller, which a constant-QP rung does not have, and the H.264
-        // rate controller has no calibrated lookahead (the encoder refuses
-        // one by name).
+        // cannot honour is said, not dropped: the H.264 rate controller has
+        // no calibrated lookahead (the encoder refuses one by name).
         let (rate, cpb_ms, lookahead) = match p.bitrate {
-            None => {
-                if o.lookahead_frames.is_some_and(|n| n > 0) {
-                    tracing::warn!(
-                        lookahead_frames = ?o.lookahead_frames,
-                        "this rung is constant-QP: a lookahead informs a rate controller and there \
-                         is none here, so the request is ignored (name a bitrate to have one)"
-                    );
-                }
-                (h26x::encode::RateControl::ConstantQp(qp), 0, 0)
-            }
+            // A constant-QP rung's `lookahead=` is its macroblock-tree depth
+            // instead (`preset_structure`): there is no rate controller.
+            None => (h26x::encode::RateControl::ConstantQp(qp), 0, 0),
             Some(bps) => {
                 let lookahead = if config.codec == VideoCodec::H265 {
                     p.lookahead
@@ -427,6 +505,14 @@ impl H26xEncoder {
             }
         };
 
+        let structure = preset_structure(
+            config.codec,
+            p.tier,
+            config.overrides.bframes,
+            matches!(rate, h26x::encode::RateControl::ConstantQp(_)),
+            o.lookahead_frames,
+        );
+
         // Zero means "decide for me", and the encoder's own zero means one
         // worker per core, which is the same answer — but the runtime's count
         // respects a container CPU quota where a core count does not, and a
@@ -452,14 +538,11 @@ impl H26xEncoder {
             } else {
                 config.keyframe_interval
             },
-            // Consecutive B pictures between anchors, non-pyramid — the same
-            // grammar the hardware tiers read from the same override. The
-            // encoder bumps `max_refs` to 2 itself when this is non-zero (a B
-            // needs both anchors marked), so 1 is the honest floor to declare
-            // here; over-declaring would only enlarge the DPB the SPS asks a
-            // decoder to allocate.
-            bframes: u32::from(config.overrides.bframes.unwrap_or(0)),
-            max_refs: 1,
+            // The preset's B pictures, references and lookahead — or, when
+            // the rung names `bframes`, a flat run of that many: see
+            // `preset_structure`.
+            bframes: structure.bframes,
+            max_refs: structure.max_refs,
             // Constant QP, or the rung's rate with its buffer (`cpb_ms`, 0
             // declares none) and lookahead — see the `match` above.
             rate,
@@ -476,10 +559,9 @@ impl H26xEncoder {
             // compensated for (`encoder_bps`); the encoder's rational rate
             // is not used here yet.
             fps_den: 1,
-            // The encoder's opt-in tools this tier does not expose yet, at
-            // their defaults: one prediction unit per H.265 coding unit, and
-            // default B weighting.
-            inter_parts: h26x::encode::InterParts::default(),
+            // The preset's H.265 prediction units (symmetric at slow, one
+            // per coding unit below it), and default B weighting.
+            inter_parts: structure.inter_parts,
             b_weighting: None,
             cpb_ms,
             // The encoders' opt-in tools, both codecs, from the tuning table
@@ -524,15 +606,10 @@ impl H26xEncoder {
             // default, spelled out so the literal names every field.
             interlace: None,
             field_coding: h26x::encode::FieldCoding::Paff,
-            // The crate's balanced tier: its rate-distortion analysis for
-            // H.264 and its tuned decisions for H.265, at the cost between
-            // `Veryfast` and `Slow`. The tiers are not mapped onto rivet's
-            // own targets yet; `Medium` is the crate's default, spelled out.
-            preset: h26x::encode::Preset::Medium,
-            // No H.264 B pyramid and no macroblock-tree lookahead: both add
-            // output delay a rung has not asked for.
-            pyramid: false,
-            tree_lookahead: 0,
+            // The speed tier as the encoder's preset, with its structure.
+            preset: structure.preset,
+            pyramid: structure.pyramid,
+            tree_lookahead: structure.tree_lookahead,
             legacy_decisions: false,
         };
 
@@ -546,6 +623,11 @@ impl H26xEncoder {
             rate = ?cfg.rate,
             cpb_ms = cfg.cpb_ms,
             lookahead = cfg.lookahead,
+            preset = ?cfg.preset,
+            bframes = cfg.bframes,
+            pyramid = cfg.pyramid,
+            max_refs = cfg.max_refs,
+            tree_lookahead = cfg.tree_lookahead,
             transform_8x8 = p.transform_8x8,
             subparts = p.subparts,
             sao = p.sao,
@@ -569,7 +651,6 @@ impl H26xEncoder {
             format: config.pixel_format,
             pts: Vec::new(),
             ready: VecDeque::new(),
-            force_at: None,
         })
     }
 
@@ -646,16 +727,6 @@ impl Encoder for H26xEncoder {
                 want
             );
         }
-        // The picture the encoder offers its scheduler while taking this
-        // frame is the one `lookahead` frames back; a forced IDR meant for it
-        // is handed over now (see `force_keyframe_next`).
-        let display = self.pts.len() as u64;
-        if self.force_at.is_some()
-            && display.checked_sub(u64::from(self.cfg.lookahead)) == self.force_at
-        {
-            self.inner.force_idr();
-            self.force_at = None;
-        }
         self.pts.push(frame.pts);
         let units = self
             .inner
@@ -665,20 +736,6 @@ impl Encoder for H26xEncoder {
     }
 
     fn flush(&mut self) -> Result<()> {
-        // A forced IDR still owed goes to the first picture the flush offers,
-        // which has to be the one it was promised to.
-        if let Some(at) = self.force_at.take() {
-            let first = (self.pts.len() as u64).saturating_sub(u64::from(self.cfg.lookahead));
-            if at != first {
-                bail!(
-                    "a keyframe was forced at frame {at}, but the encoder's {}-frame lookahead offers \
-                     frame {first} first on flush: fewer frames followed the forced one than the \
-                     lookahead holds, and it cannot be placed",
-                    self.cfg.lookahead
-                );
-            }
-            self.inner.force_idr();
-        }
         let units = self
             .inner
             .flush()
@@ -694,18 +751,11 @@ impl Encoder for H26xEncoder {
     /// needs the first kept frame promoted to an IDR, or the chunk will not
     /// stand alone.
     ///
-    /// **A workaround for the h26x H.265 encoder under a lookahead.** Its
-    /// `force_idr` promotes the next picture *offered to its scheduler*, and
-    /// a lookahead of `n` offers each picture `n` frames after it is pushed,
-    /// so called here it would land `n` frames early, on a lead-in picture,
-    /// and the chunk would open on a picture that predicts from discarded
-    /// ones (measured: lookahead 4, keyframe at frame 6 for frame 10). So the
-    /// frame is remembered and the encoder told on the push that offers it
-    /// (`send_frame`), or on `flush`. Without a lookahead that is the next
-    /// push, exactly as before. Remove this once `force_idr` names the next
-    /// picture pushed (on the h26x backlog).
+    /// The encoder's `force_idr` names the next picture *pushed*, whatever
+    /// lookahead (rate or macroblock tree) holds pictures back before its
+    /// scheduler sees them, so this is the next `send_frame`'s picture.
     fn force_keyframe_next(&mut self) -> Result<()> {
-        self.force_at = Some(self.pts.len() as u64);
+        self.inner.force_idr();
         Ok(())
     }
 
@@ -730,7 +780,6 @@ impl Encoder for H26xEncoder {
         self.inner = Self::build_inner(self.codec, &self.cfg)?;
         self.pts.clear();
         self.ready.clear();
-        self.force_at = None;
         tracing::debug!(
             event = "h26x_sw.reset",
             codec = ?self.codec,
@@ -744,6 +793,42 @@ impl Encoder for H26xEncoder {
 mod tests {
     use super::*;
     use crate::encode::tuning::{QualityTarget, SpeedTier};
+
+    /// Each tier is the encoder's preset with the structure it was tuned
+    /// at; a named `bframes` is a flat run; a bitrate rung has no tree.
+    #[test]
+    fn tiers_map_onto_the_presets() {
+        use h26x::encode::Preset;
+        let s = preset_structure(VideoCodec::H264, SpeedTier::Draft, None, true, None);
+        assert_eq!(
+            (s.preset, s.bframes, s.pyramid, s.max_refs, s.tree_lookahead),
+            (Preset::Veryfast, 3, true, 1, 15)
+        );
+        let s = preset_structure(VideoCodec::H264, SpeedTier::Standard, None, true, None);
+        assert_eq!((s.preset, s.tree_lookahead), (Preset::Medium, 40));
+        let s = preset_structure(VideoCodec::H264, SpeedTier::Archive, None, true, None);
+        assert_eq!(
+            (s.preset, s.max_refs, s.tree_lookahead),
+            (Preset::Slow, 5, 50)
+        );
+        let s = preset_structure(VideoCodec::H265, SpeedTier::Archive, None, true, None);
+        assert_eq!(
+            (s.max_refs, s.tree_lookahead, s.inter_parts),
+            (4, 16, h26x::encode::InterParts::Symmetric)
+        );
+        let s = preset_structure(VideoCodec::H264, SpeedTier::Standard, Some(0), false, None);
+        assert_eq!((s.bframes, s.pyramid, s.tree_lookahead), (0, false, 0));
+        let s = preset_structure(VideoCodec::H265, SpeedTier::Standard, Some(2), true, None);
+        assert_eq!((s.bframes, s.pyramid, s.tree_lookahead), (2, false, 16));
+        // A constant-QP rung's `lookahead=` is the tree's depth; a bitrate
+        // rung's is the rate controller's, and it has no tree.
+        let s = preset_structure(VideoCodec::H264, SpeedTier::Archive, Some(0), true, Some(0));
+        assert_eq!(s.tree_lookahead, 0);
+        let s = preset_structure(VideoCodec::H264, SpeedTier::Draft, None, true, Some(24));
+        assert_eq!(s.tree_lookahead, 24);
+        let s = preset_structure(VideoCodec::H265, SpeedTier::Draft, None, false, Some(24));
+        assert_eq!(s.tree_lookahead, 0);
+    }
     use crate::frame::ColorSpace;
 
     /// Every transfer the pipeline names comes back as itself through the
@@ -1346,8 +1431,9 @@ mod tests {
     }
 
     /// A lookahead reaches an H.265 bitrate rung's encoder; H.264's rate
-    /// controller has none, and a constant-QP rung no controller, so both
-    /// code with none (and say so) rather than being refused.
+    /// controller has none, so it codes with none (and says so) rather than
+    /// being refused. On a constant-QP rung, which has no controller, it is
+    /// the macroblock tree's depth.
     #[test]
     fn a_lookahead_reaches_h265_bitrate_rungs_only() {
         use crate::encode::tuning::EncodeOverrides;
@@ -1363,31 +1449,61 @@ mod tests {
             la(EncodeOverrides::default()),
         );
         assert_eq!((h265.lookahead, h264.lookahead, cqp.lookahead), (8, 0, 0));
+        assert_eq!(
+            (h265.tree_lookahead, h264.tree_lookahead, cqp.tree_lookahead),
+            (0, 0, 8)
+        );
     }
 
     /// `force_keyframe_next` makes the next frame *sent* an IDR, with or
     /// without a lookahead holding pictures back — the chunked path calls it
     /// on the first kept frame after a lead-in and slices by that frame, so
     /// a keyframe landing on a lead-in picture instead leaves the chunk
-    /// opening on a picture that predicts from discarded ones.
+    /// opening on a picture that predicts from discarded ones. Also within a
+    /// lookahead of the end, where only the flush offers that picture: an
+    /// H.265 rate lookahead, and each tier's macroblock tree (15 / 40 / 50
+    /// pictures for H.264, 16 for H.265) on a constant-QP rung.
     #[test]
     fn a_forced_keyframe_lands_on_the_next_frame_sent_under_a_lookahead() {
         use crate::encode::tuning::EncodeOverrides;
-        for lookahead in [0u32, 4] {
-            let o = EncodeOverrides {
-                lookahead_frames: Some(lookahead),
-                ..bitrate(300_000)
-            };
+        let rate = |lookahead| EncodeOverrides {
+            lookahead_frames: Some(lookahead),
+            ..bitrate(300_000)
+        };
+        let cqp = EncodeOverrides::default;
+        let cases = [
+            (VideoCodec::H265, SpeedTier::Draft, rate(0), 20u32),
+            (VideoCodec::H265, SpeedTier::Draft, rate(4), 20),
+            (VideoCodec::H265, SpeedTier::Draft, rate(4), 12),
+            (VideoCodec::H265, SpeedTier::Standard, cqp(), 20),
+            (VideoCodec::H264, SpeedTier::Draft, cqp(), 20),
+            (VideoCodec::H264, SpeedTier::Standard, cqp(), 20),
+            (VideoCodec::H264, SpeedTier::Archive, cqp(), 12),
+        ];
+        for (codec, tier, o, frames) in cases {
+            let tag = format!(
+                "{codec:?} {tier:?} lookahead {:?}, {frames} frames",
+                o.lookahead_frames
+            );
             let (w, h, fps) = CLIP;
             let cfg = EncoderConfig {
                 width: w,
                 height: h,
                 frame_rate: fps,
-                ..config_at(VideoCodec::H265, SpeedTier::Draft, o)
+                ..config_at(codec, tier, o)
             };
             let mut enc = H26xEncoder::new(cfg).expect("encoder");
             let mut keyframes = Vec::new();
-            for i in 0..20u32 {
+            let mut count = 0;
+            let mut drain = |enc: &mut H26xEncoder| {
+                while let Some(p) = enc.receive_packet().expect("packet") {
+                    count += 1;
+                    if p.is_keyframe {
+                        keyframes.push(p.pts);
+                    }
+                }
+            };
+            for i in 0..frames {
                 if i == 10 {
                     enc.force_keyframe_next().expect("force");
                 }
@@ -1400,56 +1516,14 @@ mod tests {
                     u64::from(i),
                 );
                 enc.send_frame(&frame).expect("frame");
-                while let Some(p) = enc.receive_packet().expect("packet") {
-                    if p.is_keyframe {
-                        keyframes.push(p.pts);
-                    }
-                }
+                drain(&mut enc);
             }
             enc.flush().expect("flush");
-            while let Some(p) = enc.receive_packet().expect("packet") {
-                if p.is_keyframe {
-                    keyframes.push(p.pts);
-                }
-            }
-            assert_eq!(
-                keyframes,
-                vec![0, 10],
-                "lookahead {lookahead}: keyframes at {keyframes:?}"
-            );
+            drain(&mut enc);
+            keyframes.sort_unstable();
+            assert_eq!(count, frames, "{tag}: one packet per frame");
+            assert_eq!(keyframes, vec![0, 10], "{tag}: keyframes at {keyframes:?}");
         }
-        // Forced within a lookahead of the end, the keyframe has no picture
-        // the flush could give it to: an error, not a chunk that is wrong.
-        let o = EncodeOverrides {
-            lookahead_frames: Some(4),
-            ..bitrate(300_000)
-        };
-        let (w, h, fps) = CLIP;
-        let cfg = EncoderConfig {
-            width: w,
-            height: h,
-            frame_rate: fps,
-            ..config_at(VideoCodec::H265, SpeedTier::Draft, o)
-        };
-        let mut enc = H26xEncoder::new(cfg).expect("encoder");
-        for i in 0..12u32 {
-            if i == 10 {
-                enc.force_keyframe_next().expect("force");
-            }
-            let frame = VideoFrame::new(
-                clip_picture(i).into(),
-                w,
-                h,
-                PixelFormat::Yuv420p,
-                ColorSpace::Bt709,
-                u64::from(i),
-            );
-            enc.send_frame(&frame).expect("frame");
-        }
-        let err = enc
-            .flush()
-            .expect_err("an unplaceable keyframe must be an error");
-        assert!(format!("{err:#}").contains("cannot be placed"), "{err:#}");
     }
 
     /// Every rate request this tier cannot code is refused by name before

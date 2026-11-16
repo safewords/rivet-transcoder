@@ -1191,6 +1191,19 @@ impl<'a> Engine<'a> {
             if cfg.codec == codec::frame::VideoCodec::Av1 && cfg.overrides.bframes.is_none() {
                 cfg.overrides.bframes = Some(0);
             }
+            // Live H.264 / H.265 the same way, for the same reason: the
+            // software tier's presets code a B pyramid and, at a constant
+            // QP, a macroblock-tree lookahead of 15 to 50 pictures
+            // (`h26x_sw::preset_structure`). No B pictures and no lookahead
+            // is frame in, packet out; the hardware tiers already default
+            // to both. A rung that names either keeps it.
+            if matches!(
+                cfg.codec,
+                codec::frame::VideoCodec::H264 | codec::frame::VideoCodec::H265
+            ) {
+                cfg.overrides.bframes.get_or_insert(0);
+                cfg.overrides.lookahead_frames.get_or_insert(0);
+            }
             if let Some((_, timing)) = &hls {
                 // Every segment opens on a keyframe.
                 cfg.keyframe_interval =
