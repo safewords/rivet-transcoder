@@ -141,6 +141,78 @@ fn a_live_single_file_fills_its_gaps_and_keeps_the_audio_in_step() {
     assert_eq!((audio.codec.as_str(), audio.channels), ("opus", 2));
 }
 
+/// An engine that falls behind is not a source gone quiet. The encoder
+/// stalls (here the progress sink holds the rung for five idle timeouts)
+/// while every picture the source sent waits in the queue: the job reads
+/// them all and ends with the source, not as idle with the rest thrown
+/// away. (A loaded CI runner did this to the HLS test below: it ended idle
+/// after one segment.)
+#[test]
+fn a_stalled_encoder_is_not_an_idle_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rec.mp4");
+    let spec = spec(&[
+        ("codec", "vp9"),
+        ("container", "mp4"),
+        ("audio", "drop"),
+        ("idle-timeout", "100ms"),
+    ]);
+    let stalled = std::sync::atomic::AtomicBool::new(false);
+    let sink = crate::fn_sink(move |p| {
+        if p.frames_done == 30 && !stalled.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    });
+    // Fifty pictures fit the capture queue, so none is dropped.
+    let out = run_live_job_blocking(
+        Synthetic::new(50, u64::MAX),
+        &spec,
+        LiveTarget::File(path),
+        Arc::new(sink),
+        None,
+    )
+    .expect("the live job");
+    let live = out.live.as_ref().unwrap();
+    assert_eq!(live.ended, LiveEnd::SourceEnded, "{live:?}");
+    assert_eq!((live.frames, live.dropped_behind), (50, 0), "{live:?}");
+}
+
+/// A source that stops sending without saying it has ended (what NDI does)
+/// ends the job as idle, once the engine has read all it did send.
+#[test]
+fn a_source_that_goes_quiet_ends_the_job_as_idle() {
+    /// [`Synthetic`], then nothing at all in place of its end.
+    struct Quiet(Synthetic);
+    impl LiveSource for Quiet {
+        fn next_event(&mut self, timeout: Duration) -> Result<Option<LiveEvent>> {
+            match self.0.next_event(timeout)? {
+                Some(LiveEvent::End) => {
+                    std::thread::sleep(timeout);
+                    Ok(None)
+                }
+                other => Ok(other),
+            }
+        }
+        fn name(&self) -> String {
+            self.0.name()
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let spec = spec(&[
+        ("codec", "vp9"),
+        ("container", "mp4"),
+        ("audio", "drop"),
+        ("idle-timeout", "300ms"),
+    ]);
+    let out = run(
+        Quiet(Synthetic::new(20, u64::MAX)),
+        &spec,
+        LiveTarget::File(dir.path().join("rec.mp4")),
+    );
+    let live = out.live.as_ref().unwrap();
+    assert_eq!((live.frames, live.ended), (20, LiveEnd::Idle), "{live:?}");
+}
+
 /// `duration` ends the job at exactly its frame count, and a ladder writes
 /// a file per rung, each the size it was fitted to.
 #[test]
@@ -181,6 +253,8 @@ fn a_live_hls_package_ends_as_a_finished_package() {
         &spec,
         LiveTarget::Dir(dir.path().to_path_buf()),
     );
+    let live = out.live.as_ref().unwrap();
+    assert_eq!(live.ended, LiveEnd::SourceEnded, "{live:?}");
     let master = std::fs::read_to_string(out.master_playlist.as_ref().expect("master")).unwrap();
     assert!(
         master.contains("video/64p/playlist.m3u8") || master.contains("video/"),

@@ -265,6 +265,9 @@ const QUEUE_PICTURES: usize = 60;
 struct Queue {
     pictures: AtomicUsize,
     behind: AtomicU64,
+    /// Messages sent and not yet read: the engine is caught up with the
+    /// source only when this is zero.
+    unread: AtomicUsize,
 }
 
 enum Message {
@@ -302,19 +305,23 @@ fn capture_loop<S: LiveSource>(
                 Message::Event(LiveEvent::Video(v))
             }
             Ok(Some(e @ LiveEvent::End)) => {
+                queue.unread.fetch_add(1, Ordering::AcqRel);
                 let _ = tx.send(Message::Event(e));
                 return;
             }
             Ok(Some(e)) => Message::Event(e),
             Err(e) if e.is::<SourceLost>() => {
+                queue.unread.fetch_add(1, Ordering::AcqRel);
                 let _ = tx.send(Message::Lost);
                 return;
             }
             Err(e) => {
+                queue.unread.fetch_add(1, Ordering::AcqRel);
                 let _ = tx.send(Message::Failed(e));
                 return;
             }
         };
+        queue.unread.fetch_add(1, Ordering::AcqRel);
         if tx.send(msg).is_err() {
             return;
         }
@@ -388,7 +395,11 @@ fn run_engine(
                 }
             );
         }
-        match rx.recv_timeout(left.min(Duration::from_millis(100))) {
+        let msg = rx.recv_timeout(left.min(Duration::from_millis(100)));
+        if msg.is_ok() {
+            queue.unread.fetch_sub(1, Ordering::AcqRel);
+        }
+        match msg {
             Ok(Message::Event(LiveEvent::Video(v))) => {
                 queue.pictures.fetch_sub(1, Ordering::AcqRel);
                 break v;
@@ -423,14 +434,27 @@ fn run_engine(
         if stopped() {
             break LiveEnd::Stopped;
         }
-        if realtime && !idle.is_zero() && last_picture.elapsed() >= idle {
+        // Idle is the source gone quiet, so it is judged only with the
+        // engine caught up: while anything the source sent is still unread
+        // (pictures queued behind a stalled encoder or a loaded machine, or
+        // its End), the time since the last picture read is the engine's
+        // delay, not the source's silence.
+        if realtime
+            && !idle.is_zero()
+            && queue.unread.load(Ordering::Acquire) == 0
+            && last_picture.elapsed() >= idle
+        {
             tracing::warn!(
                 seconds = idle.as_secs_f64(),
                 "no picture from the source; ending the job"
             );
             break LiveEnd::Idle;
         }
-        match rx.recv_timeout(Duration::from_millis(100)) {
+        let msg = rx.recv_timeout(Duration::from_millis(100));
+        if msg.is_ok() {
+            queue.unread.fetch_sub(1, Ordering::AcqRel);
+        }
+        match msg {
             Ok(Message::Event(LiveEvent::Video(v))) => {
                 queue.pictures.fetch_sub(1, Ordering::AcqRel);
                 last_picture = Instant::now();
