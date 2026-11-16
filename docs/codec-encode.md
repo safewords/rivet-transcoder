@@ -1262,8 +1262,26 @@ H.264 15 / 40 / 50 pictures by tier, H.265 16. The crate measures these
 presets against x264 and x265 at the same preset in
 [`crates/h26x/README.md`](../crates/h26x/README.md). At f0787cb, H.264 reaches
 x264's BD-rate in 0.96x / 0.97x / 0.92x of its time; H.265 is 13 to 14 % below
-x265 at medium, in 0.9x its time. These numbers have not been re-measured
-through `rivet transcode`.
+x265 at medium, in 0.9x its time.
+
+Measured through `rivet transcode` (2026-11-16) against the build before
+this change (d0d5367 against 1836c77), each run with
+`TRANSCODE_ENCODER_BACKEND=h26x`. Sources: foreman CIF at 180 frames, and
+ducks_take_off and park_joy 720p at 90 frames each (each looped from 30).
+Points are `--crf` 22 / 27 / 32 / 37. BD-rate is luma PSNR against the
+source. Time is wall clock for the four encodes, one run each, on an
+M-series laptop:
+
+| | `draft` | `standard` | `archive` |
+|---|---|---|---|
+| H.264 BD-rate | −10.7 to −20.0 % | −12.4 to −28.2 % | −11.2 to −21.1 % |
+| H.264 time | 0.85x to 1.24x | 1.48x to 2.04x | 1.52x to 2.23x |
+| H.265 BD-rate | −10.1 to −29.1 % | −5.1 to −20.3 % | −9.0 to −28.9 % |
+| H.265 time | 0.59x to 0.83x | 0.75x to 1.06x | 1.83x to 2.24x |
+
+H.265 `draft` and `standard` are both smaller and faster than before. The
+old tier coded every tier at the crate's medium decisions, and the veryfast
+preset decides faster.
 
 Before this the tier coded every rung at the crate's medium decisions, with
 no B pictures, one reference and no lookahead, and differed by tier only in
