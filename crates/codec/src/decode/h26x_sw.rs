@@ -349,27 +349,35 @@ mod tests {
 
     #[test]
     fn an_unsupported_stream_is_refused_up_front() {
-        // An H.264 data-partitioned slice (NAL types 2..4, Extended profile):
-        // the decoder refuses it on the NAL type, before any slice data, so
+        // An H.264 SI slice under CABAC: no profile allows it (SP / SI are
+        // Extended-profile only, and Extended has no CABAC, A.2.3), so the
+        // decoder refuses it on the slice header, before any slice data, and
         // the tier above can hand the stream on with nothing lost. (Slice
-        // groups used to be the example here; FMO decodes now.)
+        // groups and then data partitioning used to be the example here;
+        // both decode now.)
         let mut d = H26xDecoder::new(info("h264")).expect("decoder");
         // The SPS of an x264 High-profile encode (level 2.1), taken from a
-        // real stream, and a plain PPS for it.
+        // real stream.
         let sps: &[u8] = &[
             0, 0, 0, 1, 0x67, 0x64, 0x00, 0x15, 0xac, 0xd9, 0x41, 0x43, 0x3f, 0x2c, 0xd4, 0x18,
             0x04, 0x19, 0x00, 0x00, 0x03, 0x00, 0x01, 0x00, 0x00, 0x03, 0x00, 0x32, 0x1f, 0x14,
             0x29, 0x96,
         ];
-        let pps: &[u8] = &[0, 0, 0, 1, 0x68, 0xce, 0x3c, 0x80];
-        // Slice data partition A (nal_unit_type 2) of an I slice.
-        let partition_a: &[u8] = &[0, 0, 0, 1, 0x62, 0x88, 0x84, 0x00];
+        // A plain CABAC PPS for it.
+        let pps: &[u8] = &[0, 0, 0, 1, 0x68, 0xee, 0x3c, 0x80];
+        // An IDR slice whose header says SI (slice_type 4), deblocking off,
+        // then the start of its (never read) slice data.
+        let si: &[u8] = &[0, 0, 0, 1, 0x65, 0x96, 0x08, 0x06, 0xbf, 0x80];
         d.push_sample(sps).expect("a parameter set is accepted");
         d.push_sample(pps).expect("a plain PPS is accepted");
         let err = d
-            .push_sample(partition_a)
-            .expect_err("data partitioning is unsupported");
-        assert!(format!("{err:#}").contains("unsupported"), "{err:#}");
+            .push_sample(si)
+            .expect_err("an SI slice under CABAC is unsupported");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unsupported") && msg.contains("SP/SI"),
+            "{msg}"
+        );
         assert!(d.decode_next().expect("drain").is_none());
     }
 

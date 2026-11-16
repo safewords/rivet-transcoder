@@ -524,6 +524,16 @@ impl H26xEncoder {
             // default, spelled out so the literal names every field.
             interlace: None,
             field_coding: h26x::encode::FieldCoding::Paff,
+            // The crate's balanced tier: its rate-distortion analysis for
+            // H.264 and its tuned decisions for H.265, at the cost between
+            // `Veryfast` and `Slow`. The tiers are not mapped onto rivet's
+            // own targets yet; `Medium` is the crate's default, spelled out.
+            preset: h26x::encode::Preset::Medium,
+            // No H.264 B pyramid and no macroblock-tree lookahead: both add
+            // output delay a rung has not asked for.
+            pyramid: false,
+            tree_lookahead: 0,
+            legacy_decisions: false,
         };
 
         let inner = Self::build_inner(config.codec, &cfg)?;

@@ -613,15 +613,17 @@ fn av1_in_software_8_and_10_bit() {
     eprintln!("av1 software: worst luma PSNR 8-bit {worst8:.2} dB, 10-bit {worst10:.2} dB");
 
     // A bitrate rung, coded by the encoder's rate controller to its rate.
-    // (This clip, a ramp and a square, takes about 250 kb/s at the finest
-    // quantiser: a 300 kb/s rung, as this test once asked, cannot be
-    // reached by any rate controller — it came in at 0.84x at quantiser 1.)
+    // The rate has to be one this clip can spend. It is a ramp and a square
+    // decoded from rivet's own H.264 at quality 18, so its ceiling moves with
+    // that encoder: about 250 kb/s once, about 112 kb/s since the encoder
+    // analyses with rate-distortion pricing (a 200 kb/s rung came in at
+    // 0.56x, 120 kb/s at 0.87x). 80 kb/s sits well under it.
     // Coded as the frames come (`bframes=0`): in alt-ref groups the first
     // group is planned before the rate model has seen a coded frame and
     // overspends (1.3x on this one second), which later groups repay — on
     // longer runs (the encoder's unit test, 200 frames; 300 frames of
     // foreman at 300 kb/s land at 0.99x), not inside one second.
-    let bitrate = 120_000u32;
+    let bitrate = 80_000u32;
     let overrides = codec::encode::tuning::EncodeOverrides {
         bitrate: Some(bitrate),
         bframes: Some(0),
