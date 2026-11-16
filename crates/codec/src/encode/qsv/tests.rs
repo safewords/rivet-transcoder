@@ -1124,3 +1124,76 @@ fn annexb_parameter_sets_are_found_by_nal_type() {
         vec![0, 0, 0, 1, 0x67, 0x11, 0, 0, 0, 1, 0x68, 0x22]
     );
 }
+
+// ─── VP9 constant rate: rivet's own correction ──────────────────────────────
+
+/// Drives a [`Vp9RateTrim`] against a model encoder that writes `bias` times
+/// the rate it is handed (plus `first_gop_extra` in its first GOP, the
+/// start-up a real one shows), for `gops` GOPs; returns the stream's average
+/// rate and the rates handed.
+fn trim_run(bias: f64, first_gop_extra: f64, gops: u32) -> (f64, Vec<u32>) {
+    let (rate, fps, gop) = (2_000_000u32, 30.0, 60u32);
+    let mut t = Vp9RateTrim::new(rate, fps, gop);
+    let (mut total, mut handed) = (0.0, vec![t.handed_kbps]);
+    for g in 0..gops {
+        let extra = if g == 0 { first_gop_extra } else { 1.0 };
+        let written = f64::from(t.handed_kbps) * 1000.0 * bias * extra * f64::from(gop) / fps;
+        total += written;
+        if g + 1 < gops {
+            handed.push(t.next_kbps(u64::from((g + 1) * gop), written));
+        }
+    }
+    (total / (f64::from(gops * gop) / fps), handed)
+}
+
+#[test]
+fn vp9_trim_brings_an_overshooting_encoder_back_to_the_rate() {
+    // The A310's VP9 on the CI's noisy 720p clip: 1.108x at 2 Mbit/s, about
+    // 1.19x over the first GOP. Three GOPs (the CI clip) and thirty.
+    for gops in [3, 30] {
+        let (avg, handed) = trim_run(1.108, 1.07, gops);
+        assert!(
+            (avg / 2_000_000.0 - 1.0).abs() < 0.02,
+            "{gops} GOPs: {avg:.0} bit/s, handed {handed:?}"
+        );
+        assert_eq!(handed[0], 2000, "the first GOP is handed the rung's rate");
+        assert!(
+            handed[1..].iter().all(|&k| (1000..2000).contains(&k)),
+            "{handed:?}"
+        );
+    }
+}
+
+#[test]
+fn vp9_trim_never_hands_more_than_the_rate_or_less_than_half() {
+    // Content too easy to fill the rate: the encoder writes 40 % of it, and
+    // is handed the rung's rate throughout (VP9 has no filler data).
+    let (avg, handed) = trim_run(0.4, 1.0, 5);
+    assert!(handed.iter().all(|&k| k == 2000), "{handed:?}");
+    assert!((avg - 800_000.0).abs() < 1.0);
+    // An encoder at three times what it is handed: half the rate, no less.
+    let (_, handed) = trim_run(3.0, 1.0, 5);
+    assert!(handed[1..].iter().all(|&k| k == 1000), "{handed:?}");
+}
+
+#[test]
+fn vp9_trim_counts_the_gop_from_the_last_keyframe() {
+    let mut t = Vp9RateTrim::new(2_000_000, 30.0, 60);
+    assert!(!t.at_keyframe());
+    t.since_key = 59;
+    assert!(!t.at_keyframe());
+    t.since_key = 60;
+    assert!(t.at_keyframe());
+    // No keyframe interval: one GOP per frame would be a reset per frame,
+    // so the encoder only builds a trim for a positive interval; `new`
+    // still keeps the arithmetic finite.
+    assert_eq!(Vp9RateTrim::new(2_000_000, 0.0, 0).gop, 1);
+}
+
+#[test]
+fn scaled_kbps_divides_by_the_multiplier_and_never_reaches_zero() {
+    assert_eq!(scaled_kbps(2000, 1), 2000);
+    assert_eq!(scaled_kbps(2000, 0), 2000);
+    assert_eq!(scaled_kbps(100_000, 2), 50_000);
+    assert_eq!(scaled_kbps(1, 4), 1);
+}

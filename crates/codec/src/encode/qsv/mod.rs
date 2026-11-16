@@ -111,6 +111,10 @@ pub struct QsvEncoder {
     /// Set by [`Encoder::reset`]: the new stream's first keyframe must carry
     /// the parameter sets.
     param_sets_due: bool,
+    /// A VP9 constant-rate session's own rate correction, GOP by GOP: Intel's
+    /// VP9 encoder ignores the HRD buffer and overshoots the rate it is
+    /// handed (see [`Vp9RateTrim`]). `None` for every other session.
+    vp9_trim: Option<Vp9RateTrim>,
     _runtime_lib: libloading::Library,
 }
 
@@ -944,6 +948,14 @@ impl QsvEncoder {
             // buffer, cross-platform char alias).
             let _ = (MFX_EXTBUFF_AV1_BITSTREAM_PARAM, 0 as c_char);
 
+            let vp9_trim = match cbr {
+                Some(rate) if vp9 && config.keyframe_interval > 0 => Some(Vp9RateTrim::new(
+                    rate.bps,
+                    config.frame_rate,
+                    config.keyframe_interval,
+                )),
+                _ => None,
+            };
             Ok(Self {
                 config,
                 session: Some(sess),
@@ -955,12 +967,20 @@ impl QsvEncoder {
                 vp9_hidden: Vec::new(),
                 param_sets: None,
                 param_sets_due: false,
+                vp9_trim,
                 _runtime_lib: runtime_lib,
             })
         }
     }
 
     fn encode_one(&mut self, frame: &VideoFrame) -> Result<()> {
+        if self
+            .vp9_trim
+            .as_ref()
+            .is_some_and(|t| t.at_keyframe() && !self.force_idr_next)
+        {
+            self.retarget_vp9()?;
+        }
         let session = self
             .session
             .as_mut()
@@ -1157,6 +1177,13 @@ impl QsvEncoder {
         // alongside the surface backing store, and stays valid until this
         // slot's sync point is drained. A stack local here silently did
         // nothing: by the time the runtime looked, the frame was gone.
+        if let Some(t) = self.vp9_trim.as_mut() {
+            t.since_key = if self.force_idr_next {
+                1
+            } else {
+                t.since_key + 1
+            };
+        }
         let ctrl_ptr: *mut std::ffi::c_void = if self.force_idr_next {
             session.surfaces[slot_idx].ctrl = MfxEncodeCtrl::force_idr();
             &mut session.surfaces[slot_idx].ctrl as *mut MfxEncodeCtrl as *mut std::ffi::c_void
@@ -1311,6 +1338,54 @@ impl QsvEncoder {
             Ok(inner) => inner,
             Err(_) => bail!("panic in QSV encode path — aborting rather than unwinding across FFI"),
         }
+    }
+
+    /// A VP9 constant-rate session at a keyframe the encoder would place
+    /// anyway: drain it, count what it wrote, and restart its rate control
+    /// with the rate [`Vp9RateTrim::next_kbps`] asks for the next GOP. The
+    /// packets stay queued for `receive_packet`; the next frame goes in with
+    /// an explicit keyframe control, on the frame the GOP put one on.
+    fn retarget_vp9(&mut self) -> Result<()> {
+        if self.flushed || self.session.is_none() {
+            return Ok(());
+        }
+        self.flush_drain()?;
+        let Some(trim) = self.vp9_trim.as_mut() else {
+            return Ok(());
+        };
+        let written: f64 = self.encoded_packets
+            [trim.packets_counted.min(self.encoded_packets.len())..]
+            .iter()
+            .map(|p| p.data.len() as f64 * 8.0)
+            .sum();
+        trim.packets_counted = self.encoded_packets.len();
+        let before = trim.handed_kbps;
+        let kbps = trim.next_kbps(u64::from(self.frame_counter), written);
+        trim.since_key = 0;
+        let session = self.session.as_mut().expect("checked above");
+        let slot = scaled_kbps(kbps, session.video_param.mfx.brc_param_multiplier);
+        session.video_param.mfx.qpp_or_kbps_or_icq = slot;
+        session.video_param.mfx.qpb_or_maxkbps = slot;
+        let rc = unsafe {
+            (session.fn_encode_reset)(
+                session.session,
+                &mut session.video_param as *mut MfxVideoParam,
+            )
+        };
+        if rc < 0 {
+            bail!("MFXVideoENCODE_Reset (VP9 rate correction to {kbps} kbit/s) failed: {rc}");
+        }
+        self.force_idr_next = true;
+        tracing::debug!(
+            event = "qsv.vp9_rate",
+            frames = self.frame_counter,
+            gop_bits = written,
+            before_kbps = before,
+            next_kbps = kbps,
+            status = rc,
+            "QSV VP9 constant rate: the next GOP's target"
+        );
+        Ok(())
     }
 
     fn flush_drain(&mut self) -> Result<()> {
@@ -1545,6 +1620,13 @@ impl Encoder for QsvEncoder {
             session.inflight.is_empty(),
             "flush_drain retires every sync point"
         );
+        // A new stream starts at the rung's rate, with a fresh correction.
+        if let Some(t) = self.vp9_trim.as_mut() {
+            *t = Vp9RateTrim::new(t.rate_bps as u32, t.fps, t.gop);
+            let kbps = scaled_kbps(t.handed_kbps, session.video_param.mfx.brc_param_multiplier);
+            session.video_param.mfx.qpp_or_kbps_or_icq = kbps;
+            session.video_param.mfx.qpb_or_maxkbps = kbps;
+        }
         let rc = unsafe {
             (session.fn_encode_reset)(
                 session.session,

@@ -259,6 +259,107 @@ pub(super) fn cbr_params(rate: crate::encode::tuning::ConstantRate) -> CbrParams
     }
 }
 
+/// A `TargetKbps` in kilobits per second as the rate slots carry it: divided
+/// by the session's `BRCParamMultiplier`, rounded to nearest, never zero.
+pub(super) fn scaled_kbps(kbps: u32, multiplier: u16) -> u16 {
+    let m = u64::from(multiplier.max(1));
+    ((u64::from(kbps) + m / 2) / m).clamp(1, u64::from(u16::MAX)) as u16
+}
+
+// ─── VP9 constant rate: rivet's own correction ───────────────────────────────
+
+/// The rate a VP9 constant-rate session on Intel's encoder is handed, GOP by
+/// GOP, so that what it writes averages the rung's rate.
+///
+/// Intel's VP9 encoder does not hold a VP9 stream to the HRD buffer it is
+/// given. Measured on an Arc A310 (iHD, oneVPL, `MFX_RATECONTROL_CBR`), the
+/// stream is byte-identical whatever `BufferSizeInKB` (125 to 500 KB) and
+/// `InitialDelayInKB` (1 to 375 KB) say, and whatever `MaxFrameSize`
+/// (`mfxExtCodingOption2`) or the sliding window (`WinBRCMaxAvgKbps` /
+/// `WinBRCSize`, `mfxExtCodingOption3`) say: only `TargetKbps` moves it, and
+/// the stream overshoots that by a margin that depends on the content — 14 %
+/// at 1 Mbit/s on noisy 720p, 11 % at 2 Mbit/s, 8 % at 4 Mbit/s, 0 to 2 % on
+/// smoother 1080p. H.264, H.265 and AV1 on the same card hold the buffer, and
+/// the rate within 1.5 to 4 %.
+///
+/// So rivet closes the loop itself. At each keyframe the encoder would place
+/// anyway (every `GopPicSize` frames) the session is drained, what it wrote
+/// is counted, and `MFXVideoENCODE_Reset` hands it a new `TargetKbps` (and
+/// `MaxKbps`, equal under CBR) for the next GOP: the rate that brings the
+/// whole stream back to the rung's rate by the GOP's end, divided by how far
+/// the encoder has overshot what it was handed so far. The handed rate is
+/// never above the rung's rate (VP9 has no filler data: a stream the content
+/// cannot fill stays under it, as it would without this) and never under half
+/// of it.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct Vp9RateTrim {
+    /// The rung's rate, bits per second.
+    pub(super) rate_bps: u64,
+    /// Frames per second.
+    pub(super) fps: f64,
+    /// Frames from one keyframe to the next (`GopPicSize`), at least 1.
+    pub(super) gop: u32,
+    /// The rate the session holds now, kilobits per second.
+    pub(super) handed_kbps: u32,
+    /// Frames submitted since the last keyframe (the session's first frame
+    /// and every forced one restart it).
+    pub(super) since_key: u32,
+    /// Frames submitted when `handed_kbps` was last set.
+    pub(super) segment_start: u64,
+    /// Bits the encoder has written over the frames before `segment_start`.
+    pub(super) spent_bits: f64,
+    /// Bits the encoder was asked for over those frames: each segment's
+    /// handed rate times its length.
+    pub(super) asked_bits: f64,
+    /// How many of the encoder's packets `spent_bits` has counted.
+    pub(super) packets_counted: usize,
+}
+
+impl Vp9RateTrim {
+    pub(super) fn new(rate_bps: u32, fps: f64, gop: u32) -> Self {
+        Self {
+            rate_bps: u64::from(rate_bps),
+            fps: if fps > 0.0 { fps } else { 30.0 },
+            gop: gop.max(1),
+            handed_kbps: rate_bps.div_ceil(1000).max(1),
+            since_key: 0,
+            segment_start: 0,
+            spent_bits: 0.0,
+            asked_bits: 0.0,
+            packets_counted: 0,
+        }
+    }
+
+    /// Whether the next frame is one the encoder makes a keyframe of.
+    pub(super) fn at_keyframe(&self) -> bool {
+        self.since_key >= self.gop
+    }
+
+    /// Close the segment that ends after `frames` frames, the encoder having
+    /// written `written_bits` over it, and return the rate (kbps) to hand it
+    /// for the next GOP.
+    pub(super) fn next_kbps(&mut self, frames: u64, written_bits: f64) -> u32 {
+        let seg = frames.saturating_sub(self.segment_start) as f64;
+        self.spent_bits += written_bits;
+        self.asked_bits += f64::from(self.handed_kbps) * 1000.0 * seg / self.fps;
+        self.segment_start = frames;
+        let rate = self.rate_bps as f64;
+        // How far over (or under) what it was asked the encoder has written.
+        let ratio = if self.asked_bits > 0.0 && self.spent_bits > 0.0 {
+            (self.spent_bits / self.asked_bits).clamp(0.5, 4.0)
+        } else {
+            1.0
+        };
+        // The stream's budget at the end of the next GOP, less what is spent.
+        let next = f64::from(self.gop);
+        let budget = rate * (frames as f64 + next) / self.fps;
+        let want_bps = (budget - self.spent_bits) * self.fps / next;
+        let handed = (want_bps / ratio).clamp(rate / 2.0, rate);
+        self.handed_kbps = ((handed / 1000.0).round() as u32).max(1);
+        self.handed_kbps
+    }
+}
+
 // ─── Zeroed MfxVideoParam helper ──────────────────────────────────────────────
 
 /// Zero-initialise an `MfxVideoParam` for use as Query's `out` param.
