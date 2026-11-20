@@ -101,9 +101,10 @@ pub use container;
 // Flatten the most common entry points to the crate root.
 pub use gpu_pool::{GpuLease, GpuPool, LeaseKind};
 pub use job::{
-    Clip, JobOutput, LiveEnd, LiveStats, LiveTarget, RungArtifact, RungOutput, run_job,
-    run_job_blocking, run_job_blocking_owned, run_live_job, run_live_job_blocking, run_splice_job,
-    run_splice_job_blocking, single_file_extension, single_file_media_type,
+    AudioHooksOutput, Clip, JobOutput, LiveEnd, LiveStats, LiveTarget, RungArtifact, RungOutput,
+    run_audio_hooks, run_audio_hooks_blocking, run_job, run_job_blocking, run_job_blocking_owned,
+    run_live_job, run_live_job_blocking, run_splice_job, run_splice_job_blocking,
+    single_file_extension, single_file_media_type,
 };
 pub use ladder::standard_ladder;
 #[cfg(feature = "batch")]

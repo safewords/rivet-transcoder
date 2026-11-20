@@ -941,7 +941,15 @@ trait, handed only what exists at that point. A hook answers with a verdict
 `HookReport`; a policy says whether it blocks or runs on the session's
 background worker, fails open or closed, and is required or opt-in. The
 HTTP server takes hooks with `serve_with_hooks`. The built-ins only compute
-and record (`SourceDigest`, `PerceptualFingerprint`, `ArtifactDigest`).
+and record (`SourceDigest`, `PerceptualFingerprint`, `ArtifactDigest`,
+`ActivityGate`).
+
+Since 2026-11-20 there is a decoded-audio point too: the source's audio as
+PCM in chunks, delivered at the rate and channel count each hook asks for.
+It is decoded in a pass of its own, so a passthrough output is untouched by
+it, and `run_audio_hooks` runs a job whose only product is what its audio
+hooks say. A speech model or any other audio analysis is a decoded-audio
+hook; what runs the model lives outside rivet, as §33 says for vision.
 
 **Why.** Integrations — fingerprinting, content review, model inference —
 need to see the job at specific points without forking the pipeline. A

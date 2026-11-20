@@ -9,6 +9,7 @@
 //! | probe | [`ProbeHook`] | [`Hooks::probe`] | the source once demuxed (an image once its header is read), before anything is decoded | [`ProbeEvent`] |
 //! | decoded frame | [`DecodedFrameHook`] | [`Hooks::decoded_frames`] | video frames as the decoder produced them, turned upright — before tonemapping, chroma or bit-depth conversion, the spec's filters or any scaling | [`FrameEvent`] |
 //! | encoder frame | [`EncoderFrameHook`] | [`Hooks::encoder_frames`] | video frames exactly as the encoders receive them — after the colour pipeline and the filters, before per-rung scaling | [`FrameEvent`] |
+//! | decoded audio | [`DecodedAudioHook`] | [`Hooks::decoded_audio`] | the source's audio as PCM, in chunks, after the source's edit list — decoded for the hooks even where the output passes the track through, and converted to the rate and channel count the hook asks for ([`AudioDelivery`]) | [`AudioEvent`] |
 //! | still | [`StillHook`] | [`Hooks::stills`] | still pictures in an image job: the decoded image, or each still taken from a video | [`StillEvent`] |
 //! | artifact | [`ArtifactHook`] | [`Hooks::artifacts`] | each output of the [`ArtifactKind`]s it accepts, before the job returns it | [`ArtifactEvent`] |
 //! | completed | [`CompletedHook`] | [`Hooks::completed`] | the job made everything it was asked for (its last gate: it can still reject) | [`CompletedEvent`] |
@@ -21,7 +22,13 @@
 //! stopped, readable from the session the caller started.
 //!
 //! The frame hooks choose which frames they are handed ([`FrameSampling`]): a
-//! decode produces every frame, and a hook rarely needs them all.
+//! decode produces every frame, and a hook rarely needs them all. An audio
+//! hook chooses how its PCM is delivered ([`AudioDelivery`]): in chunks of how
+//! many seconds, at which rate, mixed down to mono or not.
+//!
+//! A job whose only product is what its hooks say about the audio is
+//! [`run_audio_hooks`](crate::job::run_audio_hooks): demux, decode, hooks,
+//! and no output written.
 //!
 //! The general [`Hook`] trait — any set of [`Stage`]s, one `call` for all of
 //! them — is what the kinds adapt to, and is there for the rare hook that
@@ -30,7 +37,8 @@
 //! The engine has no opinion on what a hook is for. The built-in ones compute
 //! and record: [`SourceDigest`] (content digests of the source bytes),
 //! [`PerceptualFingerprint`] (perceptual hashes of decoded frames, encoder
-//! frames or stills) and [`ArtifactDigest`] (digests of outputs). What is done
+//! frames or stills), [`ArtifactDigest`] (digests of outputs) and
+//! [`ActivityGate`] (where in the audio something is happening). What is done
 //! with a digest or a hash is the integration's: the building blocks are
 //! public ([`phash`], [`DigestAlgorithm`], [`frame`]), so a custom hook
 //! computes exactly what a built-in one does and takes it from there.
@@ -100,6 +108,8 @@ use serde_json::{Value, json};
 
 use codec::frame::VideoFrame;
 
+mod activity_gate;
+pub mod audio;
 mod builtin;
 mod digest;
 pub mod frame;
@@ -108,12 +118,13 @@ pub mod phash;
 #[cfg(test)]
 mod tests;
 
+pub use activity_gate::{ActivityGate, ActivityRange};
 pub use builtin::{ArtifactDigest, PerceptualFingerprint, SourceDigest};
 pub use digest::DigestAlgorithm;
 pub use frame::FrameFormat;
 pub use kinds::{
-    ArtifactHook, ArtifactKind, CompletedHook, DecodedFrameHook, EncoderFrameHook, FailedHook,
-    HookKind, ProbeHook, SourceHook, StillHook,
+    ArtifactHook, ArtifactKind, CompletedHook, DecodedAudioHook, DecodedFrameHook,
+    EncoderFrameHook, FailedHook, HookKind, ProbeHook, SourceHook, StillHook,
 };
 pub use phash::PerceptualAlgorithm;
 
@@ -132,6 +143,8 @@ pub enum Stage {
     DecodedFrame,
     /// A video frame as the encoders receive it.
     EncoderFrame,
+    /// A chunk of the source's audio, decoded.
+    DecodedAudio,
     /// A still picture in an image job.
     Still,
     /// One output the job made, before it is handed back.
@@ -144,11 +157,12 @@ pub enum Stage {
 
 impl Stage {
     /// Every stage, in the order a job reaches them.
-    pub const ALL: [Stage; 8] = [
+    pub const ALL: [Stage; 9] = [
         Stage::Source,
         Stage::Probe,
         Stage::DecodedFrame,
         Stage::EncoderFrame,
+        Stage::DecodedAudio,
         Stage::Still,
         Stage::Artifact,
         Stage::Completed,
@@ -162,6 +176,7 @@ impl Stage {
             Stage::Probe => "probe",
             Stage::DecodedFrame => "decoded-frame",
             Stage::EncoderFrame => "encoder-frame",
+            Stage::DecodedAudio => "decoded-audio",
             Stage::Still => "still",
             Stage::Artifact => "artifact",
             Stage::Completed => "completed",
@@ -174,8 +189,8 @@ impl Stage {
         matches!(self, Stage::DecodedFrame | Stage::EncoderFrame)
     }
 
-    fn bit(self) -> u8 {
-        1 << (self as u8)
+    fn bit(self) -> u16 {
+        1 << (self as u16)
     }
 }
 
@@ -194,12 +209,13 @@ impl std::str::FromStr for Stage {
                 "probe" => Stage::Probe,
                 "decoded-frame" | "decoded-frames" => Stage::DecodedFrame,
                 "encoder-frame" | "encoder-frames" => Stage::EncoderFrame,
+                "decoded-audio" | "audio" => Stage::DecodedAudio,
                 "still" | "stills" => Stage::Still,
                 "artifact" | "artifacts" => Stage::Artifact,
                 "completed" => Stage::Completed,
                 "failed" => Stage::Failed,
                 other => bail!(
-                    "unknown hook stage `{other}` (source, probe, decoded-frame, encoder-frame, still, artifact, completed, failed)"
+                    "unknown hook stage `{other}` (source, probe, decoded-frame, encoder-frame, decoded-audio, still, artifact, completed, failed)"
                 ),
             },
         )
@@ -208,11 +224,11 @@ impl std::str::FromStr for Stage {
 
 /// A set of [`Stage`]s.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
-pub struct StageSet(u8);
+pub struct StageSet(u16);
 
 impl StageSet {
     pub const NONE: StageSet = StageSet(0);
-    pub const ALL: StageSet = StageSet(u8::MAX);
+    pub const ALL: StageSet = StageSet(u16::MAX);
 
     pub fn of(stages: &[Stage]) -> Self {
         Self(stages.iter().fold(0, |acc, s| acc | s.bit()))
@@ -286,6 +302,9 @@ pub enum JobKind {
     AudioOnly,
     /// A still-image job (the `image` feature).
     Image,
+    /// [`run_audio_hooks`](crate::job::run_audio_hooks): the source's audio
+    /// decoded for its hooks, nothing written.
+    AudioAnalysis,
 }
 
 impl JobKind {
@@ -295,6 +314,7 @@ impl JobKind {
             JobKind::Splice => "splice",
             JobKind::AudioOnly => "audio",
             JobKind::Image => "image",
+            JobKind::AudioAnalysis => "audio-analysis",
         }
     }
 }
@@ -320,6 +340,13 @@ pub enum Subject {
         index: u64,
         seconds: f64,
     },
+    /// One chunk of a source's audio: where it starts and how long it is,
+    /// in seconds from the start of that source's audio.
+    Audio {
+        clip: usize,
+        seconds: f64,
+        duration: f64,
+    },
     /// One output, by label.
     Artifact { label: String },
 }
@@ -343,6 +370,11 @@ impl Subject {
             } => {
                 json!({ "type": "still", "clip": clip, "index": index, "seconds": seconds })
             }
+            Subject::Audio {
+                clip,
+                seconds,
+                duration,
+            } => json!({ "type": "audio", "clip": clip, "seconds": seconds, "duration": duration }),
             Subject::Artifact { label } => json!({ "type": "artifact", "label": label }),
         }
     }
@@ -359,6 +391,14 @@ impl fmt::Display for Subject {
                 seconds,
             } => write!(f, "frame {index} of source {clip} ({seconds:.3}s)"),
             Subject::Still { clip, index, .. } => write!(f, "still {index} of source {clip}"),
+            Subject::Audio {
+                clip,
+                seconds,
+                duration,
+            } => write!(
+                f,
+                "audio of source {clip} at {seconds:.3}s ({duration:.3}s)"
+            ),
             Subject::Artifact { label } => write!(f, "artifact `{label}`"),
         }
     }
@@ -466,6 +506,51 @@ pub struct FrameEvent {
     pub frame: VideoFrame,
 }
 
+/// A chunk of a source's audio, decoded, for the decoded-audio hooks.
+///
+/// The samples are what the source plays: its edit list applied (priming and
+/// trims hidden, Opus pre-skip removed) and any holes its timestamps leave
+/// filled with silence, so `seconds` is the chunk's time in the audio as it
+/// is heard. They are delivered as the hook's [`AudioDelivery`] asks: at its
+/// rate, mixed down to mono or not. Consecutive chunks join without a gap
+/// or an overlap; the last is usually shorter.
+#[derive(Debug, Clone)]
+pub struct AudioEvent {
+    /// The source's position in a splice; `0` otherwise.
+    pub clip: usize,
+    /// Its place among the chunks this hook is handed from this source.
+    pub index: u64,
+    /// Where the chunk starts, in seconds from the start of the source's
+    /// audio.
+    pub seconds: f64,
+    /// The source's audio codec (`aac`, `opus`, ...).
+    pub codec: String,
+    /// The rate of `samples`.
+    pub sample_rate: u32,
+    /// How many channels `samples` interleaves: `1` when the delivery asks
+    /// for mono, the decoded track's count otherwise.
+    pub channels: u8,
+    /// Interleaved samples (`LRLR...` for stereo) in `[-1.0, 1.0]`. Cheap to
+    /// clone.
+    pub samples: Arc<[f32]>,
+}
+
+impl AudioEvent {
+    /// Samples per channel.
+    pub fn frames(&self) -> usize {
+        self.samples.len() / usize::from(self.channels.max(1))
+    }
+
+    /// The chunk's length in seconds.
+    pub fn duration(&self) -> f64 {
+        if self.sample_rate == 0 {
+            0.0
+        } else {
+            self.frames() as f64 / f64::from(self.sample_rate)
+        }
+    }
+}
+
 /// One still picture in an image job.
 #[derive(Debug, Clone)]
 pub struct StillEvent {
@@ -527,6 +612,7 @@ pub enum HookEvent {
     Probe(ProbeEvent),
     DecodedFrame(FrameEvent),
     EncoderFrame(FrameEvent),
+    DecodedAudio(AudioEvent),
     Still(StillEvent),
     Artifact(ArtifactEvent),
     Completed(CompletedEvent),
@@ -540,6 +626,7 @@ impl HookEvent {
             HookEvent::Probe(_) => Stage::Probe,
             HookEvent::DecodedFrame(_) => Stage::DecodedFrame,
             HookEvent::EncoderFrame(_) => Stage::EncoderFrame,
+            HookEvent::DecodedAudio(_) => Stage::DecodedAudio,
             HookEvent::Still(_) => Stage::Still,
             HookEvent::Artifact(_) => Stage::Artifact,
             HookEvent::Completed(_) => Stage::Completed,
@@ -555,6 +642,11 @@ impl HookEvent {
                 clip: e.clip,
                 index: e.index,
                 seconds: e.seconds,
+            },
+            HookEvent::DecodedAudio(e) => Subject::Audio {
+                clip: e.clip,
+                seconds: e.seconds,
+                duration: e.duration(),
             },
             HookEvent::Still(e) => Subject::Still {
                 clip: e.clip,
@@ -589,6 +681,15 @@ impl HookEvent {
             HookEvent::DecodedFrame(e) | HookEvent::EncoderFrame(e) => {
                 frame_json(e.clip, e.index, e.seconds, &e.frame)
             }
+            HookEvent::DecodedAudio(e) => json!({
+                "clip": e.clip,
+                "index": e.index,
+                "seconds": e.seconds,
+                "duration": e.duration(),
+                "codec": e.codec,
+                "sample_rate": e.sample_rate,
+                "channels": e.channels,
+            }),
             HookEvent::Still(e) => {
                 let mut v = frame_json(e.clip, e.index, e.seconds, &e.frame);
                 v["from_video"] = e.from_video.into();
@@ -837,6 +938,71 @@ impl FrameSampling {
     }
 }
 
+/// How a decoded-audio hook is handed the audio.
+///
+/// The track is decoded once whatever its hooks ask; each hook gets its own
+/// chunks, converted to its own rate and channel count by rivet's resampler
+/// (a speech model's 16 kHz mono, say) as one continuous stream, so nothing
+/// rings or clicks at a chunk's edge.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AudioDelivery {
+    /// The chunk length in seconds (the last chunk is what is left).
+    pub chunk_seconds: f64,
+    /// The rate to deliver at; `None` keeps the rate the track decodes at.
+    pub sample_rate: Option<u32>,
+    /// Mix every channel down to one (an equal-weight average).
+    pub mono: bool,
+}
+
+impl Default for AudioDelivery {
+    /// Ten-second chunks at the decoded rate and channel count.
+    fn default() -> Self {
+        Self {
+            chunk_seconds: 10.0,
+            sample_rate: None,
+            mono: false,
+        }
+    }
+}
+
+impl AudioDelivery {
+    /// Chunks of `seconds`, at the decoded rate and channel count.
+    pub fn chunks_of(seconds: f64) -> Self {
+        Self {
+            chunk_seconds: seconds,
+            ..Self::default()
+        }
+    }
+
+    /// 16 kHz mono: what speech models take.
+    pub fn speech() -> Self {
+        Self {
+            chunk_seconds: 30.0,
+            sample_rate: Some(16_000),
+            mono: true,
+        }
+    }
+
+    pub fn sample_rate(self, rate: u32) -> Self {
+        Self {
+            sample_rate: Some(rate),
+            ..self
+        }
+    }
+
+    pub fn mono(self) -> Self {
+        Self { mono: true, ..self }
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "chunk_seconds": self.chunk_seconds,
+            "sample_rate": self.sample_rate,
+            "mono": self.mono,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The general hook trait
 // ---------------------------------------------------------------------------
@@ -856,6 +1022,11 @@ pub trait Hook: Send + Sync {
     /// Which frames it is handed at the sampled frame stages.
     fn sampling(&self) -> FrameSampling {
         FrameSampling::default()
+    }
+
+    /// How it is handed the audio at [`Stage::DecodedAudio`].
+    fn audio_delivery(&self) -> AudioDelivery {
+        AudioDelivery::default()
     }
 
     /// Answer one event.
@@ -1026,6 +1197,7 @@ struct Entry {
     kind: HookKind,
     stages: StageSet,
     sampling: FrameSampling,
+    audio: AudioDelivery,
     artifact_kinds: Vec<ArtifactKind>,
 }
 
@@ -1081,6 +1253,7 @@ impl Hooks {
         let entry = Entry {
             stages: hook.stages(),
             sampling: hook.sampling(),
+            audio: hook.audio_delivery(),
             kind: hook.kind(),
             artifact_kinds: hook.artifact_kinds(),
             name: name.clone(),
@@ -1129,6 +1302,7 @@ impl Hooks {
                     "on_error": match e.policy.on_error { OnError::Continue => "continue", OnError::Reject => "reject" },
                     "required": e.policy.required,
                     "frames": e.stages.has_sampled().then(|| e.sampling.to_json()),
+                    "audio": e.stages.contains(Stage::DecodedAudio).then(|| e.audio.to_json()),
                     "artifact_kinds": e.stages.contains(Stage::Artifact)
                         .then(|| e.artifact_kinds.iter().map(|k| k.as_str()).collect::<Vec<_>>()),
                 })
@@ -1286,6 +1460,26 @@ impl Hooks {
         frame: &VideoFrame,
     ) -> Result<()> {
         self.emit_sampled(Stage::EncoderFrame, clip, index, fps, frame)
+    }
+
+    /// The decoded-audio hooks, by position, with how each wants the audio:
+    /// what the engine decodes for. Empty when no hook takes audio.
+    pub(crate) fn audio_deliveries(&self) -> Vec<(usize, AudioDelivery)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.stages.contains(Stage::DecodedAudio))
+            .map(|(i, e)| (i, e.audio))
+            .collect()
+    }
+
+    /// A chunk of decoded audio, to the one decoded-audio hook at position
+    /// `entry` (each hook gets chunks of its own shape).
+    pub(crate) fn emit_decoded_audio(&self, entry: usize, event: AudioEvent) -> Result<()> {
+        if self.session.is_none() {
+            return Ok(());
+        }
+        self.dispatch(HookEvent::DecodedAudio(event), |i, _| i == entry)
     }
 
     /// A still picture, to every still hook.

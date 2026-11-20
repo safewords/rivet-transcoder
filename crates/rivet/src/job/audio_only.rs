@@ -120,6 +120,15 @@ pub(super) async fn run(
     let edit = src
         .edit
         .map(|e| container::edit::AudioEdit { delay: 0, ..e });
+    super::audio_tap::tap_audio(
+        &spec.hooks,
+        0,
+        Some(&src.track),
+        edit,
+        &src.gaps,
+        spec.he_aac,
+        spec.audio_decode_deny,
+    )?;
     let prepared = prepare_audio(Some(&src.track), edit, &src.gaps, AudioRequest::of(spec))
         .context("preparing audio")?
         .filter(|a| a.has_samples())

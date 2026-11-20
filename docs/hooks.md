@@ -27,6 +27,7 @@ on CPU, CUDA, DirectML and OpenVINO.
 | probe | `ProbeHook` | `Hooks::probe` | The source once demuxed (or an image's header read), before anything is decoded. | `ProbeEvent`: a `MediaSummary` (container, codecs, upright size, rate, duration, frame count, `still`) |
 | decoded frame | `DecodedFrameHook` | `Hooks::decoded_frames` | Video frames as the decoder produced them, turned upright. This is before tonemapping, chroma or bit-depth conversion, the spec's filters, or any scaling, so it's what the source holds whatever output is asked for. | `FrameEvent`: the `VideoFrame` in the decoder's pixel format, `index`, `seconds`, `clip` |
 | encoder frame | `EncoderFrameHook` | `Hooks::encoder_frames` | Video frames exactly as the encoders receive them. That's after the colour pipeline and the filters, and before each rung's scaling. | `FrameEvent`: always `yuv420p` / `yuv420p10le` |
+| decoded audio | `DecodedAudioHook` | `Hooks::decoded_audio` | The source's audio as PCM, in chunks, after the source's edit list (priming, trims and Opus pre-skip hidden; holes in its timestamps filled with silence). Decoded for the hooks even where the output passes the track through untouched. | `AudioEvent`: interleaved `f32` `samples` at the hook's `sample_rate` and `channels`, `seconds`, `index`, `codec`, `clip` |
 | still | `StillHook` | `Hooks::stills` | Still pictures in an image job: the decoded image, or each still taken from a video. Every one (no sampling). | `StillEvent`: upright 8-bit RGBA, `index`, `seconds`, `from_video` |
 | artifact | `ArtifactHook` | `Hooks::artifacts` | Each output of the `ArtifactKind`s it accepts (`video`, `audio`, `image`, `rendition`, `playlist`), before the job returns it. | `ArtifactEvent`: `kind`, `label`, `media_type`, size, `data` (`Bytes`, an HLS `Directory`, or a `File`) |
 | completed | `CompletedHook` | `Hooks::completed` | The job produced everything it was asked for. This is the last gate: a rejection here still fails the job. | `CompletedEvent`: artifact count, elapsed time |
@@ -42,12 +43,13 @@ name. At each point, hooks run in the order they were registered.
 
 Where each kind runs in each kind of job:
 
-| Job | source | probe | decoded frame | encoder frame | still | artifact | completed / failed |
-|-----|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
-| `run_job` (video out) | ✓ | ✓ | ✓ | ✓ | | ✓ video / rendition / playlist | ✓ |
-| `run_job` (audio-only out) | ✓ | ✓ | | | | ✓ audio | ✓ |
-| `run_splice_job` | ✓ per clip | ✓ per clip | ✓ | ✓ | | ✓ | ✓ |
-| `image::run_image_job_with_hooks` | ✓ | ✓ | | | ✓ | ✓ image | ✓ |
+| Job | source | probe | decoded frame | encoder frame | decoded audio | still | artifact | completed / failed |
+|-----|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
+| `run_job` (video out) | ✓ | ✓ | ✓ | ✓ | ✓ | | ✓ video / rendition / playlist | ✓ |
+| `run_job` (audio-only out) | ✓ | ✓ | | | ✓ | | ✓ audio | ✓ |
+| `run_splice_job` | ✓ per clip | ✓ per clip | ✓ | ✓ | ✓ per clip | | ✓ | ✓ |
+| `run_audio_hooks` (nothing written) | ✓ | ✓ | | | ✓ | | | ✓ |
+| `image::run_image_job_with_hooks` | ✓ | ✓ | | | | ✓ | ✓ image | ✓ |
 
 ### Source-material hashing
 
@@ -102,6 +104,74 @@ that tensor. The resizing ones read only the source pixels their output needs,
 so their cost follows the output's size, not the frame's.
 [hooks-yolo.md](hooks-yolo.md) uses them.
 
+## Decoded audio
+
+An audio hook says how it wants the audio with `delivery() -> AudioDelivery`:
+
+| Field | Meaning |
+|-------|---------|
+| `chunk_seconds` | The chunk length. The default is 10.0. The last chunk is what is left. |
+| `sample_rate` | The rate to deliver at. `None` (the default) keeps the rate the track decodes at. |
+| `mono` | Mix every channel down to one, an equal-weight average. Off by default. |
+
+`AudioDelivery::speech()` is 16 kHz mono in 30-second chunks, what speech
+models take. The track is decoded once whatever its hooks ask. Each hook's
+audio is converted by rivet's own resampler as one continuous stream and
+then cut into chunks, so a hook gets exactly what converting the whole track
+would give, with nothing at a chunk's edge. Consecutive chunks join without a
+gap or an overlap: `seconds` is where a chunk starts in the audio as heard.
+
+Audio is decoded in a pass of its own, apart from the output's: a
+passthrough stays a byte-for-byte copy, and the hooks hear the same PCM
+whatever the output does with the track. `audio-decode-deny` is honoured (a
+denied codec is never decoded, and the hooks get nothing). `he-aac=core`
+gives the hooks the core decode; under `he-aac=passthrough` an HE-AAC track
+is still decoded in full for them, since the output is untouched. A track
+that cannot be decoded at all is logged and the hooks get nothing, except in
+`run_audio_hooks`, where it fails the job.
+
+Chunks of one source reach a hook in order, from one thread.
+`rivet::hooks::audio` has `mono`, `rms` and `dbfs` for working with them.
+
+### A job for the audio alone
+
+`run_audio_hooks(input, &hooks)` runs the source, probe, decoded-audio and
+completed (or failed) hooks over `input`'s audio and writes nothing. The
+input can be any file rivet reads audio from, including an HLS audio
+rendition's `init.mp4` followed by its segments. It returns the codec and the
+`HookReport`. A set with no decoded-audio hook is refused.
+
+```rust
+use rivet::hooks::*;
+
+let gate = ActivityGate::new();
+let hooks = Hooks::new().decoded_audio("activity", gate);
+let out = rivet::run_audio_hooks(bytes, &hooks).await?;
+for range in gate.ranges(&out.hooks, "activity") {
+    println!("{:.2}s to {:.2}s", range.start, range.end);
+}
+```
+
+### The activity gate
+
+`ActivityGate` records where the audio is active: loud enough, against its
+own background, to hold something. It is a gate, not a classifier. Speech,
+singing, a shout and music with a vocal all pass, and what it leaves out is
+the quiet (silence, room tone, a fan). Its use is in front of a speech model,
+which then spends no time on silence and does not invent words to fill it.
+
+Each chunk (16 kHz mono, 30 s) is cut into 30 ms frames and each frame's
+level taken. The background is the chunk's 10th-percentile level, capped at
+`max_background_dbfs` (-40) so that a chunk loud all the way through is
+passed rather than hidden. A frame is active `margin_db` (12) above the
+background and above `floor_dbfs` (-50). Gaps under `hangover` (0.35 s) are
+joined, runs under `min_active` (0.25 s) dropped, and each range widened by
+`padding` (0.15 s).
+
+Each chunk's record carries `active` (`[[start, end], ...]` in seconds from
+the start of the audio) and `active_seconds`. `ActivityGate::ranges(report,
+name)` joins them across chunks.
+
 ## Verdicts, policies, and failure
 
 Every kind's method returns `Result<HookOutcome>`:
@@ -155,9 +225,11 @@ helpers are `by_kind`, `by_hook`, `annotations(key)`, `errors()`, and
 |------|--------------|
 | `SourceDigest` (source) | SHA-256 / SHA-1 / MD5 of the source bytes. |
 | `PerceptualFingerprint` (decoded frame, encoder frame, still) | aHash / dHash / pHash of each picture it gets. |
+| `ActivityGate` (decoded audio) | Where the audio is active, by level against its background. |
 | `ArtifactDigest` (artifact) | Digests of each output of the kinds it accepts. A directory records an object mapping each file to its digest. |
 | `DigestAlgorithm` | `.digest(bytes)`, `.hex(bytes)`. |
 | `phash` | `PerceptualAlgorithm::{AHash, DHash, PHash}` with `.hash_frame(&frame)` / `.hash_luma(..)`, plus `hamming`, `to_hex`, `from_hex`, `shrink`. Bit layout matches the common `imagehash` implementations. |
+| `audio` | `mono`, `rms`, `dbfs` for an `AudioEvent`'s samples. |
 | `frame` | `luma8`, `rgb8`, `encode` (PPM / PGM / raw); `rgb8_resized`, `rgb8_letterboxed` + `Letterbox`, `rgb8_to_planar_f32`, `planar_f32_letterboxed` for model input ([inference.md](inference.md#4-getting-pixels-into-a-model)). |
 
 The built-ins compute and record. Comparing, storing or forwarding what they
@@ -212,8 +284,8 @@ rivet::server::serve_with_hooks(addr, hooks).await?;     // or build_router_with
 ```
 
 - `GET /v1/hooks` lists them: name, `kind`, description, stages, mode,
-  `on_error`, `required`, `frames` (sampling, for the frame kinds), and
-  `artifact_kinds`.
+  `on_error`, `required`, `frames` (sampling, for the frame kinds), `audio`
+  (delivery, for the decoded-audio kind), and `artifact_kinds`.
 - Required hooks run on every job. A request opts into optional ones with
   `?hooks=a,b` or `"hooks": [...]`. Naming one that isn't configured is a
   `400`. Requests can only choose among configured hooks.
@@ -228,4 +300,6 @@ An empty `Hooks` does nothing. Each point first checks whether any hook of
 its kind is registered, and a frame no hook selects is never cloned. A
 selected frame is a reference-count bump, not a pixel copy. Artifact events
 copy a single-file output's bytes, and only when an artifact hook is
-registered.
+registered. Audio is decoded for the hooks only when a decoded-audio hook is
+registered; that pass costs a decode of the track (cheap beside a video
+decode) and, per hook asking for another rate, a resample.

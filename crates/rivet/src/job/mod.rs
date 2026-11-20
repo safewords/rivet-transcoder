@@ -31,7 +31,11 @@ use crate::spec::{OutputMode, OutputSpec, Rung};
 use crate::validate::needs_chroma_downsample;
 
 mod audio;
+mod audio_hooks;
+#[cfg(test)]
+mod audio_hooks_tests;
 mod audio_only;
+mod audio_tap;
 pub(crate) use audio::audio_unusable;
 #[cfg(test)]
 mod audio_tests;
@@ -54,6 +58,7 @@ mod subtitles;
 #[cfg(test)]
 mod tests;
 
+pub use audio_hooks::{AudioHooksOutput, run_audio_hooks, run_audio_hooks_blocking};
 pub use live::{
     LiveEnd, LiveStats, LiveTarget, check_live_spec, run_live_job, run_live_job_blocking,
 };
@@ -496,6 +501,17 @@ async fn run_job_inner(
         AudioRequest::of(spec),
     )
     .context("preparing audio")?;
+    // The decoded-audio hooks hear the track whatever the output does with
+    // it (a passthrough is decoded for them alone).
+    audio_tap::tap_audio(
+        &spec.hooks,
+        0,
+        audio_track.as_ref(),
+        audio_edit,
+        &audio_gaps,
+        spec.he_aac,
+        spec.audio_decode_deny,
+    )?;
     let prepared_audio = match spec.mode {
         OutputMode::SingleFile => fit_single_file(prepared_audio, spec.container)?,
         OutputMode::Hls { .. } | OutputMode::AudioOnly => prepared_audio,
@@ -847,6 +863,15 @@ async fn run_splice_job_inner(
             AudioRequest::of(spec),
         )
         .with_context(|| format!("preparing audio for splice clip {i}"))?;
+        audio_tap::tap_audio(
+            &spec.hooks,
+            i,
+            demuxer.audio(),
+            demuxer.audio_edit(),
+            demuxer.audio_gaps(),
+            spec.he_aac,
+            spec.audio_decode_deny,
+        )?;
         let audio_stereo = stereo_fallback(spec, audio.as_ref(), || {
             prepare_audio(
                 demuxer.audio(),

@@ -8,9 +8,9 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 
 use super::{
-    ArtifactEvent, CompletedEvent, FailedEvent, FrameEvent, FrameSampling, Hook, HookContext,
-    HookEvent, HookOutcome, HookPolicy, Hooks, ProbeEvent, SourceEvent, Stage, StageSet,
-    StillEvent,
+    ArtifactEvent, AudioDelivery, AudioEvent, CompletedEvent, FailedEvent, FrameEvent,
+    FrameSampling, Hook, HookContext, HookEvent, HookOutcome, HookPolicy, Hooks, ProbeEvent,
+    SourceEvent, Stage, StageSet, StillEvent,
 };
 
 /// Which kind of hook an entry is.
@@ -20,6 +20,7 @@ pub enum HookKind {
     Probe,
     DecodedFrame,
     EncoderFrame,
+    DecodedAudio,
     Still,
     Artifact,
     Completed,
@@ -35,6 +36,7 @@ impl HookKind {
             HookKind::Probe => "probe",
             HookKind::DecodedFrame => "decoded-frame",
             HookKind::EncoderFrame => "encoder-frame",
+            HookKind::DecodedAudio => "decoded-audio",
             HookKind::Still => "still",
             HookKind::Artifact => "artifact",
             HookKind::Completed => "completed",
@@ -164,6 +166,24 @@ pub trait EncoderFrameHook: Send + Sync {
     }
 }
 
+/// The source's audio, decoded, in chunks: after the source's edit list, with
+/// the holes its timestamps leave filled with silence, delivered at the rate
+/// and channel count [`delivery`](Self::delivery) asks for. A track the
+/// output passes through untouched is decoded for these hooks all the same.
+/// Every chunk, in order, from one thread per source.
+pub trait DecodedAudioHook: Send + Sync {
+    /// How it is handed the audio.
+    fn delivery(&self) -> AudioDelivery {
+        AudioDelivery::default()
+    }
+
+    fn on_decoded_audio(&self, ctx: &HookContext, audio: &AudioEvent) -> Result<HookOutcome>;
+
+    fn describe(&self) -> String {
+        "decoded-audio hook".into()
+    }
+}
+
 /// Still pictures in an image job: the decoded image, or each still taken from
 /// a video. Upright 8-bit RGBA, every one (no sampling).
 pub trait StillHook: Send + Sync {
@@ -252,6 +272,11 @@ adapter!(EncoderFrameAdapter, EncoderFrameHook, EncoderFrame, on_encoder_frame {
         self.0.sampling()
     }
 });
+adapter!(DecodedAudioAdapter, DecodedAudioHook, DecodedAudio, on_decoded_audio {
+    fn audio_delivery(&self) -> AudioDelivery {
+        self.0.delivery()
+    }
+});
 adapter!(StillAdapter, StillHook, Still, on_still {});
 adapter!(ArtifactAdapter, ArtifactHook, Artifact, on_artifact {
     fn artifact_kinds(&self) -> Vec<ArtifactKind> {
@@ -307,6 +332,13 @@ impl Hooks {
         encoder_frames_with,
         EncoderFrameHook,
         EncoderFrameAdapter
+    );
+    register!(
+        /// Register a [`DecodedAudioHook`]: the source's audio as PCM.
+        decoded_audio,
+        decoded_audio_with,
+        DecodedAudioHook,
+        DecodedAudioAdapter
     );
     register!(
         /// Register a [`StillHook`]: still pictures in an image job.
@@ -365,6 +397,7 @@ shared!(SourceHook { on_source(SourceEvent) });
 shared!(ProbeHook { on_probe(ProbeEvent) });
 shared!(DecodedFrameHook { on_decoded_frame(FrameEvent) }, sampling -> FrameSampling);
 shared!(EncoderFrameHook { on_encoder_frame(FrameEvent) }, sampling -> FrameSampling);
+shared!(DecodedAudioHook { on_decoded_audio(AudioEvent) }, delivery -> AudioDelivery);
 shared!(StillHook { on_still(StillEvent) });
 shared!(ArtifactHook { on_artifact(ArtifactEvent) }, kinds -> Vec<ArtifactKind>);
 shared!(CompletedHook { on_completed(CompletedEvent) });

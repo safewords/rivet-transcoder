@@ -843,7 +843,10 @@ pub(super) fn prepare_audio(
 
 /// The edit that hides a decoded Opus track's pre-skip, from its `OpusHead`,
 /// for a track whose container states no edit.
-fn opus_pre_skip_edit(codec: &str, track: &AudioTrack) -> Option<container::edit::AudioEdit> {
+pub(super) fn opus_pre_skip_edit(
+    codec: &str,
+    track: &AudioTrack,
+) -> Option<container::edit::AudioEdit> {
     if codec != "opus" {
         return None;
     }
