@@ -1708,6 +1708,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_browser_recording_under_a_30_fps_cap_keeps_every_frame() {
+        // A Chromium MediaRecorder MP4: 56 frames over 1.97 s, fragmented,
+        // with an `mdhd` duration of 0.05 s. Read as the truth that made the
+        // source ~1100 fps, and the ladder's 30 fps cap kept 2 of the 56
+        // frames. Its fragments say ~28 fps, under the cap: nothing dropped.
+        let input = Bytes::from_static(include_bytes!(
+            "../../container/tests/fixtures/fragmented/chromium_mediarecorder_h264.mp4"
+        ));
+        let header = streaming::demux_streaming(&input)
+            .expect("demux")
+            .header()
+            .clone();
+        let decimate = decimation(header.info.frame_rate, Some(30.0));
+        assert_eq!(
+            decimate, None,
+            "{} fps read as over a 30 fps cap",
+            header.info.frame_rate
+        );
+        let cfg = DecodePumpConfig {
+            codec_name: header.codec.clone(),
+            info_for_decoder: header.info.clone(),
+            source_color_metadata: header.info.color_metadata,
+            source_pixel_format: header.info.pixel_format,
+            needs_downsample: false,
+            chroma_downsample: Default::default(),
+            output_pixel_format: header.info.pixel_format,
+            tonemap_to_sdr: true,
+            sdr_to_hdr: None,
+            gpu_index: None,
+            sample_range: None,
+            software_share: 1,
+            rotation_degrees: header.rotation_degrees,
+            filters: std::sync::Arc::new(
+                codec::filter::FilterChain::prepare(&[]).expect("empty chain"),
+            ),
+            decimate,
+            hooks: crate::hooks::Hooks::default(),
+        };
+        let frames = match pump_frames(cfg, input) {
+            Ok(frames) => frames,
+            Err(e) => {
+                eprintln!("SKIP: no H.264 decoder on this host/build ({e:#})");
+                return;
+            }
+        };
+        assert_eq!(frames.len(), 56);
+    }
+
     /// Decode with the pump under `cfg`, collecting every frame it emits.
     fn pump_frames(cfg: DecodePumpConfig, input: Bytes) -> Result<Vec<VideoFrame>> {
         let rt = tokio::runtime::Builder::new_multi_thread()

@@ -155,6 +155,19 @@ demuxer — same box tree — and `detect_container` returns `"mp4"` for `ftyp m
   could not read (`unreadable_…`) is surfaced by name with no packets instead
   of as "no audio", so a job refuses it by name
   ([decision 42](decisions.md#42-a-source-with-audio-never-silently-becomes-a-video-only-output)).
+- **A fragmented file's timing is its fragments'.** When the file has
+  `moof`s, the streaming demuxer reads every sample from the
+  `moof`/`traf`/`trun` table, and the table's per-sample durations set
+  `StreamInfo.duration`, `frame_rate` and `total_frames`; the moov's
+  `mdhd.duration` is not used. In a fragmented file that field covers only the
+  moov's own samples (usually none), and writers fill it unreliably: Chromium's
+  `MediaRecorder` writes the `mvhd`'s milliseconds against a 30000 `mdhd`
+  timescale, so a 5.2 s recording of 156 frames read as 0.17 s at ~900 fps.
+  The frame rate is what a frame-rate cap decimates against
+  ([decision 31](decisions.md#31-a-frame-rate-cap-drops-frames-it-never-retimes-them)),
+  so until 2026-11-20, when the fragments were consulted only for a zero
+  duration, a 30 fps cap kept 4 of those 156 frames. The fixture is
+  `tests/fixtures/fragmented/chromium_mediarecorder_h264.mp4`.
 - **Verbatim AAC ASC.** Audio extraction pulls the `AudioSpecificConfig` bytes
   straight out of the `esds` descriptor, *not* the `mp4` crate's rebuilt form, so
   HE-AAC / xHE-AAC signaling bits survive the copy

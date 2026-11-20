@@ -919,6 +919,14 @@ index no longer counts the output frames before it.
 **Where.** `decimation` and `DecodePumpConfig::decimate` in
 [`decode_pump.rs`](../crates/rivet/src/decode_pump.rs).
 
+**What it rests on.** Decimation trusts `StreamInfo.frame_rate`. Retiming did
+not: a source whose rate was misread still kept every frame. A demuxer that
+overstates the rate therefore drops real frames under a cap, and fragmented
+MP4s from Chromium's `MediaRecorder` did exactly that from this decision until
+2026-11-20, at ~900–1400 fps read against 30 (see
+[container.md](container.md#mp4--mov-isobmff), "A fragmented file's timing is
+its fragments'").
+
 ---
 
 ## Extension

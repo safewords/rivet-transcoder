@@ -309,39 +309,49 @@ fn init(data: bytes::Bytes, edits: Edits) -> Result<Mp4StreamingDemuxer> {
         None => sample_count,
     };
 
-    // Recompute frame_rate + duration from fragmented sample timestamps
-    // when (a) we built a fragmented sample table AND (b) the static
-    // moov sample table was empty or had a zero duration. Pure
-    // fragmented MP4 — common from web recorders, screen capture
-    // tools, and modern phone exports — leaves moov with no static
-    // samples + tkhd.duration=0; the previous fallback was the 30.0
-    // sentinel, which silently encoded a 24-fps VFR source as 30-fps
-    // CFR and produced ~20% short output. The fragmented sample
-    // table's actual duration_ticks (from moof.traf.trun per-sample
-    // duration entries) carries the truth. Trust the static table
-    // when it's populated — that path was correct already.
+    // A fragmented MP4's timing is its fragments'. Every sample this reader
+    // yields comes from the moof/traf/trun table, so the table's per-sample
+    // durations are the length of what is decoded, and they replace whatever
+    // the moov says: in a fragmented file `mdhd.duration` covers only the
+    // moov's own samples (usually none), and writers fill it unreliably.
+    // Pure fragmented MP4 — web recorders, screen capture, phone exports —
+    // used to be recomputed here only when that duration was zero. Chromium's
+    // MediaRecorder writes a non-zero one that is not the recording's length
+    // (5200 against a 30000 timescale for a 5.2 s recording: the `mvhd`'s
+    // milliseconds), so 156 frames read as a fraction of a second at
+    // ~1000 fps, and a 30 fps frame-rate cap then decimated them to 4. Before that the zero case had fallen back to a 30.0 sentinel,
+    // which encoded a 24 fps VFR source as 30 fps CFR, ~20% short.
     if let Some(table) = fragmented_samples.as_ref()
         && !table.is_empty()
-        && (sample_count == 0 || duration <= 0.0)
         && video_track_timescale > 0
     {
         let total_ticks: u64 = table.iter().map(|s| s.duration_ticks as u64).sum();
         if total_ticks > 0 {
             let total_seconds = total_ticks as f64 / video_track_timescale as f64;
-            if total_seconds > 0.0 {
-                let avg_fps = table.len() as f64 / total_seconds;
-                info.frame_rate = avg_fps.clamp(1.0, 240.0);
-                info.duration = total_seconds;
-                info.total_frames = table.len() as u64;
+            let avg_fps = table.len() as f64 / total_seconds;
+            let (moov_duration, moov_frame_rate) = (info.duration, info.frame_rate);
+            info.frame_rate = avg_fps.clamp(1.0, 240.0);
+            info.duration = total_seconds;
+            info.total_frames = table.len() as u64;
+            let agreed = (moov_duration - total_seconds).abs() <= total_seconds * 0.01;
+            if agreed {
+                tracing::debug!(
+                    track_id,
+                    total_seconds,
+                    sample_count = table.len(),
+                    "fragmented MP4: duration from moof/traf/trun timestamps"
+                );
+            } else {
                 tracing::info!(
                     track_id,
                     avg_fps,
                     total_seconds,
+                    moov_duration,
+                    moov_frame_rate,
                     sample_count = table.len(),
                     timescale = video_track_timescale,
-                    "fragmented MP4: recomputed frame_rate + duration from \
-                     moof/traf/trun timestamps (static moov sample table \
-                     was empty)"
+                    "fragmented MP4: frame rate and duration taken from the \
+                     moof/traf/trun timestamps; the moov's disagreed"
                 );
             }
         }
