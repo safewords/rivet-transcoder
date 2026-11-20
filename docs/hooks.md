@@ -159,6 +159,8 @@ own background, to hold something. It is a gate, not a classifier. Speech,
 singing, a shout and music with a vocal all pass, and what it leaves out is
 the quiet (silence, room tone, a fan). Its use is in front of a speech model,
 which then spends no time on silence and does not invent words to fill it.
+[`rivet-transcribe`](../crates/transcribe/README.md) is that speech model:
+Whisper, as a decoded-audio hook.
 
 Each chunk (16 kHz mono, 30 s) is cut into 30 ms frames and each frame's
 level taken. The background is the chunk's 10th-percentile level, capped at

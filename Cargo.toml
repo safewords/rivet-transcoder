@@ -24,6 +24,7 @@ members = [
     "crates/codec",
     "crates/container",
     "crates/rivet",
+    "crates/transcribe",
     "examples/yolo",
 ]
 # rivet-imagecodecs (GIF, BMP, TIFF) is a workspace of its own, with a test

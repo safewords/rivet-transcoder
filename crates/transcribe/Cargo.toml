@@ -1,0 +1,36 @@
+[package]
+name = "rivet-transcribe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Speech to timed text on rivet's decoded-audio hook: Whisper through candle, weights from a directory you supply."
+
+# A crate of its own rather than part of rivet, as decisions §33 asks of model
+# inference: rivet's dependency graph gets no ML runtime from it.
+#
+# It holds no weights and fetches none. A model is a directory (config.json,
+# tokenizer.json, model.safetensors, optionally generation_config.json) that
+# the caller provides; see README.md.
+
+[dependencies]
+rivet = { path = "../rivet", package = "rivet-transcoder" }
+anyhow.workspace = true
+tracing.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Pure Rust, the version rivet's `dpir` filter already uses. No default
+# features: CPU, nothing linked.
+candle-core = { version = "0.11", default-features = false }
+candle-nn = { version = "0.11", default-features = false }
+candle-transformers = { version = "0.11", default-features = false }
+
+[dev-dependencies]
+bytes.workspace = true
+
+[features]
+default = []
+# Inference on an NVIDIA GPU (needs the CUDA toolkit at build time) or Apple's
+# Metal; CPU otherwise.
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]

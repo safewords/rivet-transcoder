@@ -949,7 +949,10 @@ PCM in chunks, delivered at the rate and channel count each hook asks for.
 It is decoded in a pass of its own, so a passthrough output is untouched by
 it, and `run_audio_hooks` runs a job whose only product is what its audio
 hooks say. A speech model or any other audio analysis is a decoded-audio
-hook; what runs the model lives outside rivet, as §33 says for vision.
+hook; what runs the model lives outside rivet, as §33 says for vision:
+Whisper is [`crates/transcribe`](../crates/transcribe/README.md)
+(`rivet-transcribe`), which holds no weights and is handed a model
+directory.
 
 **Why.** Integrations — fingerprinting, content review, model inference —
 need to see the job at specific points without forking the pipeline. A
