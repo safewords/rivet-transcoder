@@ -533,6 +533,10 @@ pub struct AudioEvent {
     /// Interleaved samples (`LRLR...` for stereo) in `[-1.0, 1.0]`. Cheap to
     /// clone.
     pub samples: Arc<[f32]>,
+    /// The last chunk of this source's audio this hook will be handed: a hook
+    /// that holds audio back between chunks (a speech model carrying a
+    /// sentence a chunk cut) finishes with it here.
+    pub last: bool,
 }
 
 impl AudioEvent {
@@ -689,6 +693,7 @@ impl HookEvent {
                 "codec": e.codec,
                 "sample_rate": e.sample_rate,
                 "channels": e.channels,
+                "last": e.last,
             }),
             HookEvent::Still(e) => {
                 let mut v = frame_json(e.clip, e.index, e.seconds, &e.frame);

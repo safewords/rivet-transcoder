@@ -93,6 +93,13 @@ fn assert_contiguous(chunks: &[AudioEvent], seconds: f64) {
         (at - seconds).abs() < 0.05,
         "{at} seconds delivered, {seconds} expected"
     );
+    let lasts: Vec<bool> = chunks.iter().map(|c| c.last).collect();
+    assert_eq!(
+        lasts.iter().filter(|&&l| l).count(),
+        1,
+        "exactly one last chunk: {lasts:?}"
+    );
+    assert!(lasts[lasts.len() - 1], "the last chunk is the final one");
 }
 
 #[test]
@@ -245,6 +252,43 @@ fn a_passthrough_is_decoded_for_the_hooks_and_left_byte_identical() {
     }
     assert_contiguous(&rec.chunks(), 1.5);
     assert_eq!(hooked.hooks.by_hook("rec").count(), rec.chunks().len());
+}
+
+#[test]
+fn audio_that_divides_into_whole_chunks_still_ends_on_a_last_chunk() {
+    // 1.5 s of 16 kHz chunks of 0.5 s: three whole chunks, nothing over.
+    let wav = {
+        let n: u32 = 24_000;
+        let mut w = Vec::new();
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36 + n * 2).to_le_bytes());
+        w.extend_from_slice(b"WAVEfmt ");
+        for v in [
+            16u32.to_le_bytes().to_vec(),
+            1u16.to_le_bytes().to_vec(),
+            1u16.to_le_bytes().to_vec(),
+            16_000u32.to_le_bytes().to_vec(),
+            32_000u32.to_le_bytes().to_vec(),
+            2u16.to_le_bytes().to_vec(),
+            16u16.to_le_bytes().to_vec(),
+        ] {
+            w.extend_from_slice(&v);
+        }
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&(n * 2).to_le_bytes());
+        w.resize(w.len() + n as usize * 2, 0);
+        w
+    };
+    let rec = Recorder::new(AudioDelivery::chunks_of(0.5));
+    let hooks = Hooks::new().decoded_audio("rec", rec.clone());
+    crate::job::run_audio_hooks_blocking(&wav, &hooks).unwrap();
+    let chunks = rec.chunks();
+    assert_eq!(chunks.len(), 3);
+    assert!(chunks.iter().all(|c| c.frames() == 8_000));
+    assert_eq!(
+        chunks.iter().map(|c| c.last).collect::<Vec<_>>(),
+        [false, false, true]
+    );
 }
 
 #[test]

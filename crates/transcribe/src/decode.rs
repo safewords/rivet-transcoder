@@ -194,6 +194,29 @@ pub fn segments_of(sampled: &[u32], tokens: &Tokens, window_seconds: f64) -> Vec
     out
 }
 
+/// Where the last closed segment in `sampled` ends, when text follows it
+/// that no timestamp closed: the sentence a window cut off. `None` when
+/// every segment was closed, or none was.
+pub fn closed_end(sampled: &[u32], tokens: &Tokens, window_seconds: f64) -> Option<f64> {
+    let body: Vec<u32> = sampled
+        .iter()
+        .copied()
+        .take_while(|&t| t != tokens.eot)
+        .collect();
+    let last_ts = body.iter().rposition(|&t| tokens.is_timestamp(t))?;
+    let open_tail = body[last_ts + 1..].iter().any(|&t| t < tokens.eot);
+    // The timestamp a segment closed on: one with text before it.
+    let closes = |i: usize| i > 0 && !tokens.is_timestamp(body[i - 1]);
+    if !open_tail {
+        return None;
+    }
+    // The opening timestamp of the open text, or the closing one before it.
+    let closing = (0..=last_ts)
+        .rev()
+        .find(|&i| tokens.is_timestamp(body[i]) && closes(i))?;
+    Some(tokens.seconds(body[closing]).min(window_seconds))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,6 +271,20 @@ mod tests {
         );
         let s = segments_of(&[ts(1.0), 0, ts(9.0)], &t, 4.0);
         assert_eq!(s[0].end, 4.0);
+    }
+
+    #[test]
+    fn a_sentence_left_open_reports_where_the_closed_ones_end() {
+        let t = tokens();
+        // <|0.00|> Hello <|1.50|><|1.50|> world (no closing timestamp)
+        assert_eq!(
+            closed_end(&[ts(0.0), 0, ts(1.5), ts(1.5), 1], &t, 30.0),
+            Some(1.5)
+        );
+        // Everything closed, then the end: nothing open.
+        assert_eq!(closed_end(&[ts(0.0), 0, ts(1.5), t.eot], &t, 30.0), None);
+        // Open text and nothing closed before it: nowhere earlier to start.
+        assert_eq!(closed_end(&[ts(0.0), 0, 1], &t, 30.0), None);
     }
 
     fn rules() -> (Rules, Tokens) {

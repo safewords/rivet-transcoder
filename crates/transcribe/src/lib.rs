@@ -39,6 +39,7 @@
 //! ```
 
 mod decode;
+mod decoder;
 mod hook;
 pub mod mel;
 mod model;

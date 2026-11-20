@@ -3,12 +3,16 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use candle_core::{Device, IndexOp, Tensor};
+use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::whisper::{self as w, audio, model::Whisper};
+use candle_transformers::models::whisper::{
+    self as w, audio,
+    model::{AudioEncoder, Whisper},
+};
 use serde::Deserialize;
 
-use crate::decode::{Rules, Segment, segments_of};
+use crate::decode::{Rules, Segment, closed_end, segments_of};
+use crate::decoder::CachedDecoder;
 use crate::mel;
 use crate::tokens::Tokens;
 
@@ -81,7 +85,12 @@ pub enum Task {
 /// What one window produced.
 #[derive(Debug, Clone)]
 pub struct WindowResult {
+    /// Every segment, text left open at the end running to the window's end.
     pub segments: Vec<Segment>,
+    /// Where the last segment the model closed ends, when text was left open
+    /// after it: a sentence the window cut. The next window can start there
+    /// and hear that sentence whole. `None` when nothing was left open.
+    pub closed_end: Option<f64>,
     /// Mean log-probability of the tokens chosen.
     pub avg_logprob: f64,
     /// The model's probability that the window holds no speech.
@@ -90,7 +99,9 @@ pub struct WindowResult {
 
 /// A loaded model.
 pub struct Engine {
-    model: Whisper,
+    encoder: AudioEncoder,
+    decoder: CachedDecoder,
+    config: w::Config,
     tokens: Tokens,
     filters: Vec<f32>,
     rules: Rules,
@@ -133,10 +144,16 @@ impl Engine {
             &config.suppress_tokens,
             &generation.begin_suppress_tokens,
         );
-        let whisper = Whisper::load(&vb, config)
-            .with_context(|| format!("loading the weights in {}", weights.display()))?;
+        let loading = || format!("loading the weights in {}", weights.display());
+        // candle's encoder, and the decoder with its self-attention cached
+        // (decoder.rs). candle loads only a whole Whisper; its decoder is
+        // dropped here.
+        let Whisper { encoder, .. } = Whisper::load(&vb, config.clone()).with_context(loading)?;
+        let decoder = CachedDecoder::load(vb.pp("model.decoder"), &config).with_context(loading)?;
         Ok(Self {
-            model: whisper,
+            encoder,
+            decoder,
+            config,
             tokens,
             filters,
             rules,
@@ -150,29 +167,21 @@ impl Engine {
 
     /// The audio features of up to 30 s of 16 kHz mono.
     fn encode(&mut self, samples: &[f32]) -> Result<Tensor> {
-        let n_mels = self.model.config.num_mel_bins;
-        let mel = audio::pcm_to_mel(&self.model.config, samples, &self.filters);
+        let n_mels = self.config.num_mel_bins;
+        let mel = audio::pcm_to_mel(&self.config, samples, &self.filters);
         let frames = mel.len() / n_mels;
         let mel = Tensor::from_vec(mel, (1, n_mels, frames), &self.device)?;
         // The encoder takes exactly 30 s (3000 frames); pcm_to_mel pads past
         // the audio with at least that much.
         let mel = mel.narrow(2, 0, w::N_FRAMES.min(frames))?;
-        Ok(self.model.encoder.forward(&mel, true)?)
-    }
-
-    fn logits(&mut self, tokens: &[u32], features: &Tensor, first: bool) -> Result<Vec<f32>> {
-        let t = Tensor::new(tokens, &self.device)?.unsqueeze(0)?;
-        let ys = self.model.decoder.forward(&t, features, first)?;
-        let (_, seq, _) = ys.dims3()?;
-        let last = ys.i((..1, seq - 1..))?;
-        let logits = self.model.decoder.final_linear(&last)?.i(0)?.i(0)?;
-        Ok(logits.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?)
+        Ok(self.encoder.forward(&mel, true)?)
     }
 
     /// The language most likely spoken in up to 30 s of 16 kHz mono.
     pub fn detect_language(&mut self, samples: &[f32]) -> Result<&'static str> {
         let features = self.encode(samples)?;
-        let logits = self.logits(&[self.tokens.sot], &features, true)?;
+        self.decoder.set_audio(&features)?;
+        let logits = self.decoder.step(&[self.tokens.sot])?;
         let (code, _) = self
             .tokens
             .languages
@@ -203,30 +212,31 @@ impl Engine {
         let prompt = [self.tokens.sot, lang, task_token];
         let mut tokens: Vec<u32> = prompt.to_vec();
         let window_seconds = samples.len() as f64 / mel::SAMPLE_RATE;
-        let max = max_tokens(&self.model.config);
+        let max = max_tokens(&self.config);
         let mut sum_logprob = 0.0;
-        let mut no_speech_prob = 0.0;
-        for step in 0..max {
-            let mut logits = self.logits(&tokens, &features, step == 0)?;
-            if step == 0
-                && let Some(ns) = self.tokens.no_speech
-            {
-                no_speech_prob = softmax_at(&logits, ns as usize);
-            }
+        self.decoder.set_audio(&features)?;
+        let mut logits = self.decoder.step(&prompt)?;
+        let no_speech_prob = self
+            .tokens
+            .no_speech
+            .map_or(0.0, |ns| softmax_at(&logits, ns as usize));
+        for _ in 0..max {
             let sampled = &tokens[prompt.len()..];
             self.rules
                 .apply(&mut logits, sampled, &self.tokens, window_seconds);
-            let next = argmax(&logits);
-            sum_logprob += log_softmax_at(&logits, next);
-            tokens.push(next as u32);
-            if next as u32 == self.tokens.eot {
+            let next = argmax(&logits) as u32;
+            sum_logprob += log_softmax_at(&logits, next as usize);
+            tokens.push(next);
+            if next == self.tokens.eot || self.decoder.room() == 0 {
                 break;
             }
+            logits = self.decoder.step(&[next])?;
         }
         let sampled = &tokens[prompt.len()..];
         let n = sampled.len().max(1) as f64;
         Ok(WindowResult {
             segments: segments_of(sampled, &self.tokens, window_seconds),
+            closed_end: closed_end(sampled, &self.tokens, window_seconds),
             avg_logprob: sum_logprob / n,
             no_speech_prob,
         })

@@ -179,14 +179,17 @@ impl AudioTap {
         Ok(())
     }
 
-    /// Hand out every whole chunk `outs[i]` holds, and with `last` what is
-    /// left.
+    /// Hand out the whole chunks `outs[i]` holds, keeping one back until
+    /// more audio arrives (so the final chunk is known to be the last, even
+    /// when the track divides into whole chunks exactly); with `last`,
+    /// everything left, the final one marked.
     fn drain(&mut self, i: usize, last: bool) -> Result<()> {
         let out = &mut self.outs[i];
         let ch = usize::from(out.channels.max(1));
         let whole = out.chunk_frames * ch;
-        while out.buf.len() >= whole || (last && !out.buf.is_empty()) {
+        while out.buf.len() > whole || (last && !out.buf.is_empty()) {
             let take = whole.min(out.buf.len());
+            let is_last = last && out.buf.len() <= whole;
             let samples: Arc<[f32]> = out.buf.drain(..take).collect();
             let event = AudioEvent {
                 clip: self.clip,
@@ -196,6 +199,7 @@ impl AudioTap {
                 sample_rate: out.rate,
                 channels: out.channels,
                 samples,
+                last: is_last,
             };
             out.emitted += (take / ch) as u64;
             out.index += 1;

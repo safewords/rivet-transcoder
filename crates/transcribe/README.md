@@ -66,10 +66,24 @@ because Whisper fills long silence with invented words. A window the model
 itself judges speechless (no-speech probability over 0.6 with a mean token
 log-probability under -1.0, Whisper's own test) records no segments.
 
-Decoding is greedy under Whisper's timestamp rules (`decode.rs`). Not done
-yet: temperature fallback for windows that decode badly, and carrying text
-across window boundaries, so a word spoken across a 30-second boundary may be
-cut.
+Decoding is greedy under Whisper's timestamp rules (`decode.rs`), with the
+decoder's self-attention cached (`decoder.rs`) so each step runs one token:
+candle's own decoder re-runs the whole text every step, which on
+whisper-tiny took 28.5 s for 62 s of speech, against 2.6 s cached.
+
+A sentence a window cuts is decoded again from its start in the next window:
+the audio after the last finished sentence is carried over, as Whisper's own
+long-form decoding seeks. A sentence counts as cut when the model left it
+open, or when the audio is still active at the window's end even though the
+model closed it (whisper-tiny closes a cut sentence a moment before the
+boundary). Carried audio and the detected language are kept per job and per
+source, so one `Transcribe` can serve several jobs.
+
+Measured on this laptop's CPU (Apple silicon, release build) with
+whisper-tiny: 52 s of synthetic speech in 4.0 s, every sentence whole.
+large-v3-turbo has not been measured.
+
+Not done yet: temperature fallback for windows that decode badly.
 
 ## Tests
 
