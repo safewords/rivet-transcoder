@@ -95,6 +95,8 @@ pub struct WindowResult {
     pub avg_logprob: f64,
     /// The model's probability that the window holds no speech.
     pub no_speech_prob: f64,
+    /// The language it was transcribed as: the one asked for, or detected.
+    pub language: String,
 }
 
 /// A loaded model.
@@ -177,10 +179,9 @@ impl Engine {
         Ok(self.encoder.forward(&mel, true)?)
     }
 
-    /// The language most likely spoken in up to 30 s of 16 kHz mono.
-    pub fn detect_language(&mut self, samples: &[f32]) -> Result<&'static str> {
-        let features = self.encode(samples)?;
-        self.decoder.set_audio(&features)?;
+    /// The language most likely spoken, from the encoder's output.
+    fn language_of(&mut self, features: &Tensor) -> Result<&'static str> {
+        self.decoder.set_audio(features)?;
         let logits = self.decoder.step(&[self.tokens.sot])?;
         let (code, _) = self
             .tokens
@@ -194,17 +195,25 @@ impl Engine {
 
     /// Up to 30 s of 16 kHz mono to timed segments (seconds from the
     /// window's start), greedily, under Whisper's timestamp rules.
+    ///
+    /// `language` `None` detects it from the same encoder pass the
+    /// transcription uses (the encoder is most of the cost: on large-v3-turbo
+    /// a second pass doubled a short clip's time).
     pub fn transcribe_window(
         &mut self,
         samples: &[f32],
-        language: &str,
+        language: Option<&str>,
         task: Task,
     ) -> Result<WindowResult> {
+        let features = self.encode(samples)?;
+        let language = match language {
+            Some(l) => l.to_string(),
+            None => self.language_of(&features)?.to_string(),
+        };
         let lang = self
             .tokens
-            .language(language)
+            .language(&language)
             .with_context(|| format!("this model has no language `{language}`"))?;
-        let features = self.encode(samples)?;
         let task_token = match task {
             Task::Transcribe => self.tokens.transcribe,
             Task::Translate => self.tokens.translate,
@@ -237,6 +246,7 @@ impl Engine {
         Ok(WindowResult {
             segments: segments_of(sampled, &self.tokens, window_seconds),
             closed_end: closed_end(sampled, &self.tokens, window_seconds),
+            language,
             avg_logprob: sum_logprob / n,
             no_speech_prob,
         })

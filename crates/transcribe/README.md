@@ -79,9 +79,21 @@ model closed it (whisper-tiny closes a cut sentence a moment before the
 boundary). Carried audio and the detected language are kept per job and per
 source, so one `Transcribe` can serve several jobs.
 
-Measured on this laptop's CPU (Apple silicon, release build) with
-whisper-tiny: 52 s of synthetic speech in 4.0 s, every sentence whole.
-large-v3-turbo has not been measured.
+Measured on an Apple M3 Max (16 cores), CPU, release build, speech from
+macOS `say`, 2026-11-20:
+
+| Model | Clip | Time | Real-time factor | Memory |
+|---|---|---|---|---|
+| whisper-tiny | 52.7 s | 4.0 s | 0.08 | |
+| large-v3-turbo | 5.7 s | 5.3 s | 0.93 | 5.0 GB |
+| large-v3-turbo | 52.7 s | 22.7 s | 0.43 | 5.0 GB |
+| large-v3-turbo | 236.5 s | 120.9 s | 0.51 | |
+
+(The 236.5 s run predates detecting the language from the transcription's
+own encoder pass, which saved one pass per job: 10.8 s → 5.3 s on the short
+clip.) The encoder, about 5 s per 30-second window on large-v3-turbo, is
+most of the cost. The weights load as f32: about 3.2 GB for turbo, 5 GB
+resident in all. Other CPUs will differ; measure where it will run.
 
 Not done yet: temperature fallback for windows that decode badly.
 

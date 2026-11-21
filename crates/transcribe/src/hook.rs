@@ -167,16 +167,16 @@ impl Transcribe {
             heard[a..b].copy_from_slice(&piece[a..b]);
         }
         let mut engine = self.engine.lock().unwrap();
-        let language = match (&self.options.language, &stream.language) {
-            (Some(l), _) | (None, Some(l)) => l.clone(),
-            (None, None) => {
-                let l = engine.detect_language(&heard)?.to_string();
-                stream.language = Some(l.clone());
-                l
-            }
-        };
-        let result = engine.transcribe_window(&heard, &language, self.options.task)?;
+        let language = self
+            .options
+            .language
+            .clone()
+            .or_else(|| stream.language.clone());
+        let result = engine.transcribe_window(&heard, language.as_deref(), self.options.task)?;
         drop(engine);
+        stream
+            .language
+            .get_or_insert_with(|| result.language.clone());
         if result.no_speech_prob > self.options.no_speech_threshold
             && result.avg_logprob < self.options.logprob_threshold
         {
