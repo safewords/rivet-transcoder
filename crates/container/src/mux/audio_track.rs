@@ -341,6 +341,10 @@ pub(super) fn build_opus_sample_entry(info: &AudioInfo) -> Vec<u8> {
 /// requires Version=0 in dOps (this is THE box version, not the Opus
 /// stream version). We force-write 0 here regardless of what the input
 /// `codec_private[0]` says.
+/// The `dOps` InputSampleRate: the rate of the sample entry (see
+/// [`build_dops`]).
+pub(super) const OPUS_DOPS_INPUT_RATE: u32 = 48_000;
+
 pub(super) fn build_dops(info: &AudioInfo) -> Vec<u8> {
     let p = &info.codec_private;
     debug_assert!(
@@ -363,7 +367,14 @@ pub(super) fn build_dops(info: &AudioInfo) -> Vec<u8> {
     //   [13..13+N]  ChannelMapping (u8 per output channel)
     let output_channels = p[1];
     let pre_skip = u16::from_le_bytes([p[2], p[3]]);
-    let input_sample_rate = u32::from_le_bytes([p[4], p[5], p[6], p[7]]);
+    // InputSampleRate is written as 48 kHz, not the OpusHead's. RFC 7845
+    // makes it informational (the rate the source had before encoding), but
+    // Chrome's MP4 parser refuses a `dOps` whose rate differs from the sample
+    // entry's, which is always 48000 (`build_opus_sample_entry`): a 44.1 kHz
+    // source encoded to Opus failed every audio append with "Opus
+    // AudioSampleEntry sample rate mismatches OpusSpecificBox". An Opus
+    // passthrough from an encoder that records 44100 failed the same way.
+    let input_sample_rate = OPUS_DOPS_INPUT_RATE;
     let output_gain = i16::from_le_bytes([p[8], p[9]]);
     let channel_mapping_family = p[10];
 

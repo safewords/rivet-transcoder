@@ -188,6 +188,35 @@ fn opus_sample_entry_samplerate_is_48000_q16() {
     );
 }
 
+/// A 44.1 kHz source encoded to Opus carries 44100 as its OpusHead
+/// InputSampleRate. `dOps` must still say 48000, the sample entry's rate:
+/// Chrome refuses the pair otherwise ("Opus AudioSampleEntry sample rate
+/// mismatches OpusSpecificBox"), and every audio append failed (lewd.net
+/// post 9843, a Vorbis WebM).
+#[test]
+fn dops_input_rate_matches_the_sample_entry_for_a_44k_source() {
+    let mut head = opus_head_stereo_48k_preskip_312();
+    head[4..8].copy_from_slice(&44_100u32.to_le_bytes());
+    let info = AudioInfo {
+        sample_rate: 44_100,
+        codec_private: head,
+        ..opus_info_stereo_48k()
+    };
+    let entry = build_opus_sample_entry(&info);
+    let entry_rate = u32::from_be_bytes([entry[32], entry[33], entry[34], entry[35]]) >> 16;
+    let at = entry.windows(4).position(|w| w == b"dOps").expect("dOps") + 4;
+    let dops_rate =
+        u32::from_be_bytes([entry[at + 4], entry[at + 5], entry[at + 6], entry[at + 7]]);
+    assert_eq!((entry_rate, dops_rate), (48_000, 48_000));
+    // The rest of the head is carried as it was.
+    assert_eq!(entry[at + 1], 2, "OutputChannelCount");
+    assert_eq!(
+        u16::from_be_bytes([entry[at + 2], entry[at + 3]]),
+        312,
+        "PreSkip"
+    );
+}
+
 /// `dOps` must nest inside the `Opus` sample entry. The build_audio_stsd
 /// dispatcher routes Opus → build_opus_sample_entry → dOps child.
 #[test]
