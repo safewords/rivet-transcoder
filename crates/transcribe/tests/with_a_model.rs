@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use rivet_transcribe::{SpeechModel, Transcribe, TranscribeOptions, transcribe};
+use rivet_transcribe::{OnHeard, SpeechModel, Transcribe, TranscribeOptions, transcribe};
 
 #[test]
 fn transcribes_speech_with_real_weights() {
@@ -18,10 +18,17 @@ fn transcribes_speech_with_real_weights() {
         eprintln!("RIVET_WHISPER_MODEL / RIVET_WHISPER_SPEECH not set: skipped");
         return;
     };
+    let heard = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
     let t = Arc::new(
         Transcribe::load(
             &SpeechModel::new(&model, "test"),
-            TranscribeOptions::default(),
+            TranscribeOptions {
+                on_heard: Some(OnHeard::new({
+                    let heard = Arc::clone(&heard);
+                    move |s| heard.lock().unwrap().push(s)
+                })),
+                ..TranscribeOptions::default()
+            },
         )
         .expect("the model loads"),
     );
@@ -43,6 +50,21 @@ fn transcribes_speech_with_real_weights() {
         .join(" ")
         .to_lowercase();
     eprintln!("{text}");
+
+    // Progress was told as the model wrote, more often than once a window,
+    // and never past the end of what it heard.
+    let heard = heard.lock().unwrap().clone();
+    let end = out.segments.last().map_or(0.0, |s| s.end);
+    eprintln!(
+        "on_heard: {} calls, up to {:.1} s",
+        heard.len(),
+        heard.iter().cloned().fold(0.0, f64::max)
+    );
+    assert!(heard.len() > out.segments.len() / 2, "{heard:?}");
+    assert!(
+        heard.iter().all(|s| *s >= 0.0 && *s <= end + 31.0),
+        "{heard:?}"
+    );
     if let Ok(expect) = std::env::var("RIVET_WHISPER_EXPECT") {
         assert!(
             text.contains(&expect.to_lowercase()),

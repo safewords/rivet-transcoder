@@ -51,7 +51,7 @@ use anyhow::Result;
 use rivet::hooks::Hooks;
 
 pub use decode::Segment;
-pub use hook::{Transcribe, TranscribeOptions};
+pub use hook::{OnHeard, Transcribe, TranscribeOptions};
 pub use model::{REQUIRED_FILES, SpeechModel, Task};
 
 /// What [`transcribe`] heard.

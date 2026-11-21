@@ -1,7 +1,7 @@
 //! [`Transcribe`]: the decoded-audio hook that turns speech into timed text.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use rivet::hooks::{
@@ -27,6 +27,28 @@ pub struct TranscribeOptions {
     /// taken to hold no speech (Whisper's own test: 0.6 and -1.0).
     pub no_speech_threshold: f64,
     pub logprob_threshold: f64,
+    /// Told how far into the source's audio the model has heard, in
+    /// seconds, as it works: each time it writes a timestamp (the end of a
+    /// line, every few seconds of speech), and at the end of every window.
+    /// For a progress bar; the values can step back a little where a window
+    /// re-hears a sentence the one before it cut.
+    pub on_heard: Option<OnHeard>,
+}
+
+/// A [`TranscribeOptions::on_heard`] callback.
+#[derive(Clone)]
+pub struct OnHeard(pub Arc<dyn Fn(f64) + Send + Sync>);
+
+impl OnHeard {
+    pub fn new(f: impl Fn(f64) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+}
+
+impl std::fmt::Debug for OnHeard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OnHeard(..)")
+    }
 }
 
 impl Default for TranscribeOptions {
@@ -37,6 +59,7 @@ impl Default for TranscribeOptions {
             gate: ActivityGate::default(),
             no_speech_threshold: 0.6,
             logprob_threshold: -1.0,
+            on_heard: None,
         }
     }
 }
@@ -154,6 +177,12 @@ impl Transcribe {
         stream: &mut Stream,
     ) -> Result<(Vec<Segment>, f64)> {
         let length = piece.len() as f64 / 16_000.0;
+        let base = stream.start;
+        let mut heard_to = |t: f64| {
+            if let Some(on_heard) = &self.options.on_heard {
+                (on_heard.0)(base + t);
+            }
+        };
         let active = self.options.gate.detect(piece, 16_000, 0.0);
         if active.is_empty() {
             return Ok((Vec::new(), length));
@@ -172,7 +201,12 @@ impl Transcribe {
             .language
             .clone()
             .or_else(|| stream.language.clone());
-        let result = engine.transcribe_window(&heard, language.as_deref(), self.options.task)?;
+        let result = engine.transcribe_window(
+            &heard,
+            language.as_deref(),
+            self.options.task,
+            &mut heard_to,
+        )?;
         drop(engine);
         stream
             .language
@@ -259,6 +293,9 @@ impl DecodedAudioHook for Transcribe {
             let used = ((used * 16_000.0).round() as usize).clamp(1, n);
             stream.samples.drain(..used);
             stream.start += used as f64 / 16_000.0;
+            if let Some(on_heard) = &self.options.on_heard {
+                (on_heard.0)(stream.start);
+            }
         }
         let carried = stream.samples.len() as f64 / 16_000.0;
         let language = stream

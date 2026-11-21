@@ -199,11 +199,14 @@ impl Engine {
     /// `language` `None` detects it from the same encoder pass the
     /// transcription uses (the encoder is most of the cost: on large-v3-turbo
     /// a second pass doubled a short clip's time).
+    /// `heard` is told each timestamp the model writes, in seconds from the
+    /// window's start, as it writes it.
     pub fn transcribe_window(
         &mut self,
         samples: &[f32],
         language: Option<&str>,
         task: Task,
+        heard: &mut dyn FnMut(f64),
     ) -> Result<WindowResult> {
         let features = self.encode(samples)?;
         let language = match language {
@@ -236,6 +239,9 @@ impl Engine {
             let next = argmax(&logits) as u32;
             sum_logprob += log_softmax_at(&logits, next as usize);
             tokens.push(next);
+            if self.tokens.is_timestamp(next) {
+                heard(self.tokens.seconds(next).min(window_seconds));
+            }
             if next == self.tokens.eot || self.decoder.room() == 0 {
                 break;
             }

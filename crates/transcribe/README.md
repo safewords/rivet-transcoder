@@ -52,6 +52,11 @@ let hooks = rivet::hooks::Hooks::new()
 
 `Transcribe::segments(&report, "transcribe")` reads the segments back.
 
+For a progress bar, `TranscribeOptions::on_heard` is told how far into the
+audio the model has heard, in seconds, as it writes: at each timestamp it
+emits (the end of a line, every few seconds of speech) and at the end of every
+window, rather than only once per 30-second window.
+
 From the command line:
 
 ```sh
