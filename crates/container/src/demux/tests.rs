@@ -523,3 +523,70 @@ mod box_sizes {
         }
     }
 }
+
+/// A WebM of `frames` VP9 frames 1/30 s apart, its DefaultDuration then
+/// overwritten with `default_ns` in place (the muxer writes it as four bytes
+/// for 30 fps, and an EBML unsigned integer may carry leading zeros).
+fn webm_at_30fps_saying(frames: usize, default_ns: u32) -> Vec<u8> {
+    let mut m = crate::webm::WebmMuxer::new(64, 48, 30.0, frame::VideoCodec::Vp9).unwrap();
+    for pts in 0..frames as u64 {
+        m.add_packet(frame::EncodedPacket {
+            data: bytes::Bytes::from_static(&[0x82, 0x49, 0x83, 0x42, 0x00]),
+            pts,
+            is_keyframe: true,
+        })
+        .unwrap();
+    }
+    let mut file = m.finalize().unwrap();
+    let at = file
+        .windows(4)
+        .position(|w| w == [0x23, 0xE3, 0x83, 0x84])
+        .expect("a four-byte DefaultDuration")
+        + 4;
+    file[at..at + 4].copy_from_slice(&default_ns.to_be_bytes());
+    file
+}
+
+/// ffmpeg writes DefaultDuration as one millisecond when it remuxes a stream
+/// whose rate it does not know. That was read as 1000 fps, and every rung
+/// was encoded at it.
+#[test]
+fn a_one_millisecond_default_duration_gives_way_to_the_timestamps() {
+    use crate::streaming::StreamingDemuxer;
+    let file = webm_at_30fps_saying(90, 1_000_000);
+    let mut demuxer = super::demux_mkv_streaming_init(bytes::Bytes::from(file)).unwrap();
+    let fps = demuxer.header().info.frame_rate;
+    assert!((fps - 30.0).abs() < 0.5, "read as {fps} fps");
+    let sample = demuxer.next_video_sample().unwrap().unwrap();
+    assert!(
+        (33_000_000..=34_000_000).contains(&sample.duration_ticks),
+        "a frame lasts {} ns",
+        sample.duration_ticks
+    );
+}
+
+/// A DefaultDuration the timestamps agree with is kept as written: it is
+/// exact where millisecond timestamps are not (23.976 fps, say).
+#[test]
+fn a_default_duration_the_timestamps_agree_with_is_kept() {
+    use crate::streaming::StreamingDemuxer;
+    let file = webm_at_30fps_saying(90, 33_366_700);
+    let demuxer = super::demux_mkv_streaming_init(bytes::Bytes::from(file)).unwrap();
+    assert_eq!(
+        demuxer.header().info.frame_rate,
+        1_000_000_000.0 / 33_366_700.0
+    );
+}
+
+#[test]
+fn a_default_duration_stands_when_there_are_no_timestamps_to_check_it() {
+    assert_eq!(
+        super::mkv::checked_default_duration(Some(41_708_333), None),
+        Some(41_708_333)
+    );
+    assert_eq!(super::mkv::checked_default_duration(None, None), None);
+    assert_eq!(
+        super::mkv::checked_default_duration(None, Some(25.0)),
+        Some(40_000_000)
+    );
+}

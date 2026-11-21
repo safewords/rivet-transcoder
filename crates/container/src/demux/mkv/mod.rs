@@ -557,20 +557,17 @@ pub(crate) fn demux_mkv_streaming_init(data: bytes::Bytes) -> Result<MkvStreamin
     // tolerates 0 (matches the AVI / TS behaviour).
     let bitrate = tag_bitrate.unwrap_or(0);
 
-    // For frame_rate we apply the Squad-32 fallback chain as far as it
-    // goes without the materialized sample count. samples/duration is
-    // unknowable in streaming, so use DefaultDuration first then 30.0.
-    let frame_rate = if let Some(dd_ns) = track_default_duration_ns.filter(|n| *n > 0) {
-        1_000_000_000.0 / dd_ns as f64
-    } else if duration > 0.0 {
-        // duration-only fallback: assume 30 fps × duration as the floor.
-        // This matches what the legacy path produced when sample count
-        // was tiny; for normal media DefaultDuration is virtually always
-        // present.
-        30.0
-    } else {
-        30.0
-    };
+    // The frame rate, and the per-frame duration a Block without its own
+    // falls back to, both come from DefaultDuration when the timestamps of
+    // the first frames agree with it, else from those timestamps; 30.0 when
+    // neither says. See `checked_default_duration`.
+    let track_default_duration_ns = checked_default_duration(
+        track_default_duration_ns,
+        timestamp_frame_rate(&owned, track_number, timestamp_scale),
+    );
+    let frame_rate = track_default_duration_ns
+        .map(|dd_ns| 1_000_000_000.0 / dd_ns as f64)
+        .unwrap_or(30.0);
 
     // Pixel format detection requires a sample. AVC / HEVC take it from the
     // first frame below, the one the colour is read from; the other codecs
@@ -708,6 +705,73 @@ fn video_colour_window(
         }
     }
     Some(window.finish("mkv"))
+}
+
+/// How many video frames [`timestamp_frame_rate`] reads: twenty seconds at
+/// 30 fps, enough to average out a millisecond timestamp's rounding.
+const TIMESTAMP_PROBE_FRAMES: usize = 600;
+
+/// How far DefaultDuration's rate may stray from the timestamps' before the
+/// timestamps win: a variable-rate phone recording can average a few percent
+/// off its nominal rate, a misread one is off by orders of magnitude.
+const DEFAULT_DURATION_TOLERANCE: f64 = 0.15;
+
+/// The frame rate the presentation timestamps of the first
+/// [`TIMESTAMP_PROBE_FRAMES`] frames of `track_number` give, read through a
+/// throwaway reader over `data`. Frames sharing a timestamp count once: VP8
+/// and VP9 store a hidden alt-ref frame beside the frame it is shown with.
+/// `None` when fewer than two distinct timestamps are found.
+fn timestamp_frame_rate(data: &[u8], track_number: u64, timestamp_scale: u64) -> Option<f64> {
+    let mut mkv = MatroskaFile::open(Cursor::new(data)).ok()?;
+    let mut frame = MkvFrame::default();
+    let mut stamps = Vec::with_capacity(TIMESTAMP_PROBE_FRAMES);
+    while stamps.len() < TIMESTAMP_PROBE_FRAMES {
+        match mkv.next_frame(&mut frame) {
+            Ok(true) if frame.track == track_number => {
+                stamps.push(frame.timestamp.saturating_mul(timestamp_scale));
+            }
+            Ok(true) => {}
+            _ => break,
+        }
+    }
+    // Sorted, as AVC / HEVC blocks are in decode order.
+    stamps.sort_unstable();
+    stamps.dedup();
+    let span_ns = stamps.last()?.checked_sub(*stamps.first()?)?;
+    if stamps.len() < 2 || span_ns == 0 {
+        return None;
+    }
+    Some((stamps.len() - 1) as f64 * 1_000_000_000.0 / span_ns as f64)
+}
+
+/// The track's DefaultDuration (`default_ns`) if the timestamps' frame rate
+/// (`timestamp_fps`) agrees with it within [`DEFAULT_DURATION_TOLERANCE`],
+/// else the duration those timestamps give.
+///
+/// ffmpeg, remuxing a stream whose rate it does not know (a yt-dlp download
+/// of a YouTube WebM, for one), writes DefaultDuration as one tick of the
+/// millisecond timebase: 1 000 000 ns, read as 1000 fps. Every rung was then
+/// encoded at that rate and dropped nearly all of its frames.
+pub(crate) fn checked_default_duration(
+    default_ns: Option<u64>,
+    timestamp_fps: Option<f64>,
+) -> Option<u64> {
+    let default_ns = default_ns.filter(|n| *n > 0);
+    let Some(fps) = timestamp_fps.filter(|f| f.is_finite() && *f > 0.0) else {
+        return default_ns;
+    };
+    if let Some(ns) = default_ns {
+        let default_fps = 1_000_000_000.0 / ns as f64;
+        if (default_fps - fps).abs() <= fps * DEFAULT_DURATION_TOLERANCE {
+            return Some(ns);
+        }
+        tracing::info!(
+            default_duration_fps = default_fps,
+            timestamp_fps = fps,
+            "MKV: frame rate taken from the block timestamps; the DefaultDuration disagreed"
+        );
+    }
+    Some((1_000_000_000.0 / fps).round() as u64)
 }
 
 impl StreamingDemuxer for MkvStreamingDemuxer {
